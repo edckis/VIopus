@@ -42,6 +42,10 @@ switch ($Action) {
       if ($line -match 'VICTORY_GAME_DIR=([^"]+)') { $env:VICTORY_GAME_DIR = $matches[1].Trim() }
     }
     if (-not $env:VICTORY_GAME_DIR) { 'set VICTORY_GAME_DIR (or create local.cmd, see README) to the folder of your own copy of the game first'; exit 1 }
+    # Every launch starts from clean settings: what an earlier launch in the same PowerShell session
+    # set (VICTORY_*, GK_*) would otherwise carry over to this one (it did: A/B runs in one batch all
+    # ran with the first variant's switches). Only the game folder is kept.
+    Get-ChildItem Env: | Where-Object { ($_.Name -like 'VICTORY_*' -or $_.Name -like 'GK_*') -and $_.Name -ne 'VICTORY_GAME_DIR' } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
     $env:VICTORY_LOG = 'info'
     $env:VICTORY_KEYS = '9:Enter'
     # several settings: separate with ';' (a comma stays inside a value, as in VICTORY_SKIP_NAMES)
