@@ -32,6 +32,10 @@ if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 rem VIopus: the card reads and writes the title's memory in place (no copy, no tracking, no copy-back)
 if not defined VICTORY_PORT_ALL set "VICTORY_PORT_ALL=1"
 if not defined VICTORY_INPLACE set "VICTORY_INPLACE=2"
+rem ...except the title's 32-bit graphics heap, kept as a copy: the title keeps its allocator's bookkeeping
+rem in it, and with it in place a 10-minute fast drive crashed there; as a copy a 15-minute drive at top
+rem speed did not (about 1-2 fps less while driving). VICTORY_PORT_LOW=1 puts it in place again.
+if not defined VICTORY_PORT_LOW set "VICTORY_PORT_LOW=0"
 
 rem A frame waits at most 10 ms for a pipeline still compiling (the default 500 made 300-800 ms spikes)
 if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=10"

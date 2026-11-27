@@ -34,7 +34,8 @@ These runs use the Series S profile and the same test save: a city street at noo
 
 Other measurements on this PC:
 
-- **VIopus while driving fast**, played by hand for 8 minutes: 21.7 fps on average, a median of 22.3, the slowest 10% of samples below 16.7, and about 7,300 draws a frame. The run crashed after 10.5 minutes (see *Known problems*).
+- **VIopus while driving fast, as it ships now** (graphics heap kept as a copy, 60 fps cap): 15.5 minutes at top speed in the fastest car, played by hand. **No crash.** It averaged 19.9 fps, with a median of 19.5, the slowest 10% of samples below 15.9, and a peak of 34.4. About 7,200 draws a frame.
+- **The same drive with the graphics heap in place** (8 minutes): 21.7 fps on average, a median of 22.3, the slowest 10% below 16.7. It crashed after 10.5 minutes (see fix 2).
 - **VIopus on foot for 30 minutes**, automated: no crash, with memory flat at 27–28 GB private. It ran at 28–30.6 fps through town (5,500–8,000 draws), and a steady 30.0 fps in light scenes.
 - **[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) as shipped:** 12.2 fps (83 ms a frame) on an earlier city save where cool_fox did 20.7 fps. Its renderer ports crashed AMD's shader compiler at boot until Belobug added the compiler-crash guard.
 - **Belobug-AMD `main`** (2026-11-26): 5–7 fps in the open world.
@@ -57,7 +58,13 @@ The numbers mean the following:
    - **The change:** VIopus lifts that limit. Every title buffer or window that is one committed stretch of a section is used where the title has it, with no host copy, no write tracking and no copy-back.
    - **The reason:** the bytes themselves are small, about 115 MB up and 30 MB back a frame, which is about 6 ms of raw bus time. The ~30 ms was the bookkeeping that keeps two copies in step.
    - **The result:** the submit thread dropped from 48.6 to 24–33 ms a frame, and fps rose 10–30% over the same build without it.
-   - **The limit:** the card cannot follow scattered 64 KiB pages. Tile mappings into a heap opened from the title's memory remove the device. So pages must form one stretch to qualify.
+   - **The limit:** the card cannot follow scattered 64 KiB pages. Tile mappings into a heap opened from the title's memory remove the device. So pages must form one stretch to qualify. How much memory qualifies changes from run to run with how the title lays out its pages: between 485 and 688 MB of the pool, and between 208 and 381 MB of private buffers. That is the biggest source of run-to-run difference.
+   - **The exception, the 32-bit graphics heap** (`VICTORY_PORT_LOW=0`, the default):
+     - **The crash:** with this heap in place, a fast drive crashed after 10.5 minutes. The title was walking a linked list of its own allocator whose node, 3 KB into this heap, held garbage. The title keeps its CPU bookkeeping inside the memory the card writes.
+     - **The fix:** the heap is kept as a copy, as before port 1.
+     - **The cost:** about 1–2 fps while driving; nothing measurable in the standing benchmarks.
+     - **The result:** a 15-minute drive at top speed did not crash.
+     - `VICTORY_PORT_LOW=1` puts the heap back in place.
 3. **No 300–800 ms freezes while new pipelines compile**: `VICTORY_PIPELINE_WAIT_MS=10`, set in `tools\settings.cmd`.
    - **Before:** a frame waited up to 500 ms for a pipeline still compiling, and the worst frames measured exactly 500.8 ms.
    - **Now:** a new effect shows a frame or two late instead. Play feels much smoother with less input lag.
@@ -67,13 +74,14 @@ The numbers mean the following:
    - **cool_fox / Vice-Tay:** a skip list, `warm-bad.txt`, held in `pipeline/library.rs` (`known_bad`), held up for 98 minutes with no crash.
    - **VIopus:** Belobug's compiler-crash guard catches these crashes at run time, so the skip list isn't needed here.
 6. **The 30 fps cap lifted to 60.** This is upstream's `VICTORY_FRAME_INTERVAL_MS` switch, now on by default in `tools\settings.cmd`. The loader patches the three places where the title reads its own frame-rate setting (`rate=60` in the log), so its clock and simulation step stay right, and the frame clock ticks at 16.667 ms. The heavy city scenes are below 30 fps anyway, so they are unchanged; light scenes are no longer stopped at exactly 30.0. Set `VICTORY_FRAME_INTERVAL_MS=33.333` to bring back the console's 30.
-7. **Faster locks in the descriptor heap host** (cool_fox only, about 5–7%). This patch is kept for reference in [`docs/patches/cool_fox-local-changes.patch`](docs/patches/cool_fox-local-changes.patch) and is not yet ported to VIopus.
+7. **Faster locks in the descriptor heap host.** In cool_fox this was worth about 5–7%. The part that stops 8 threads from fighting over the same reference counts is now ported: `HostHeap::keep` checks the slot without a lock. In VIopus it brought no measurable change, because list translation is not what limits the frame here (see below). The rest is kept for reference in [`docs/patches/cool_fox-local-changes.patch`](docs/patches/cool_fox-local-changes.patch).
 
 ### Tried and measured, no gain on this PC
 
 - **System settings:** Windows power plan, process and helper-thread priorities, CPU affinity layouts, spinning thread pools.
 - **Thread counts and build:** `VICTORY_THIN_THREADS` of 4, 6 or 12; `VICTORY_WIDE_THREADS=8`; thin LTO with `codegen-units=1`.
-- **Other switches:** `VICTORY_HEAP_SYNC_EARLY`, `VICTORY_JOIN_PARTS=32`, `VICTORY_SUBMIT_FRAMES=2`.
+- **Other switches:** `VICTORY_HEAP_SYNC_EARLY`, `VICTORY_JOIN_PARTS=32`, `VICTORY_SUBMIT_FRAMES=2` (tested twice, 2×2 runs).
+- **Skipping the sun's shadow maps:** `VICTORY_SKIP_NAMES=CascadeShadows`. That removes about 22% of all draw calls, but fps didn't change (2×2 runs). So translating the title's draw calls is not what limits the frame. The limit is the submit thread's bookkeeping for memory that is still copied: about 10 ms a frame of checks, 96% of which find nothing new.
 - **Smaller memory windows:** `VICTORY_WINDOW_KB` 256 or 64 put up to 3.5 GB in place, but fps didn't change and the layer kept rebuilding regions.
 - **Moving the game data from D: to C:**, both NVMe drives.
 - **The title's own graphics settings:** they have no performance options.
@@ -81,7 +89,7 @@ The numbers mean the following:
 
 ## Known problems
 
-- **A crash after 10.5 minutes of fast driving** with in-place memory on. The title's code read a garbage pointer (`0xffffffffffffffff`) while walking data at the start of the in-place graphics heap. There are two suspects, not yet separated: in-place memory itself, or a compute pipeline that the compiler-crash guard had left out three minutes earlier. To compare, run with `set VICTORY_PORT_ALL=0` and `set VICTORY_INPLACE=0`.
+- **What corrupted the graphics heap is not found yet.** It may be a card write the translation gets wrong. Keeping the heap as a copy (fix 2) avoids the crash; one 15-minute drive is the evidence so far.
 - **Ragged dark speckle** along the left and right window edges.
 - **32 GB of RAM is tight:** the game uses 23–28 GB of private memory. Close browsers before playing.
 - **The 60 fps cap is new here.** Whether anything in the game misbehaves above 30 fps (physics, animation, scripts) has not been checked in long play yet.
