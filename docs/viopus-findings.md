@@ -11,16 +11,16 @@ All of this was measured on the PC in the [README](../README.md): Ryzen 7 9800X3
 
 **The critical chain**, the chain of work and waits each present came out of, per frame:
 
-| | Standing (47–49 ms frames) | On foot (33–38 ms frames) |
+| | Standing (47â€“49 ms frames) | On foot (33â€“38 ms frames) |
 |---|---|---|
-| The game's own code (its threads, outside our calls) | 13–17 ms, 8–12 of it the main thread | 14–18 ms, ~12 the main thread |
-| The card | 6–7 ms | 1–2 ms |
-| Woken threads waiting for a core | 3.4–4.9 ms | 3.8–4.2 ms |
-| The game polling with `Sleep` | 1.9–3.3 ms | 2.7–3.2 ms |
-| Our layer: refreshes of copies, `VirtualProtect`, `GetWriteWatch`, jobs, submit steps, landing | ~15–20 ms | ~8–12 ms |
+| The game's own code (its threads, outside our calls) | 13â€“17 ms, 8â€“12 of it the main thread | 14â€“18 ms, ~12 the main thread |
+| The card | 6â€“7 ms | 1â€“2 ms |
+| Woken threads waiting for a core | 3.4â€“4.9 ms | 3.8â€“4.2 ms |
+| The game polling with `Sleep` | 1.9â€“3.3 ms | 2.7â€“3.2 ms |
+| Our layer: refreshes of copies, `VirtualProtect`, `GetWriteWatch`, jobs, submit steps, landing | ~15â€“20 ms | ~8â€“12 ms |
 
 **The game's main thread:**
-- It runs 20–24 ms a frame.
+- It runs 20â€“24 ms a frame.
 - About 82% of that is user time and 18% kernel time (95 of 518 ms per second). The kernel part is page faults and system calls, which is our layer's.
 - Only about 60% of its running time lies on the critical chain. The game overlaps the rest with our work.
 
@@ -30,17 +30,25 @@ All of this was measured on the PC in the [README](../README.md): Ryzen 7 9800X3
 - The whole process uses about 11 of the 16 logical processors, which is 8 physical cores. The game's threads therefore share physical cores with ours through SMT.
 
 **The card:**
-- It is busy (submission start to end, timestamps) 27–28 ms a frame standing and 18–22 ms on foot.
+- It is busy (submission start to end, timestamps) 27â€“28 ms a frame standing and 18â€“22 ms on foot.
 - It is the same with the copies (28.4 ms), so reading memory in place over PCIe doesn't slow it.
-- Its time is mostly in parallel, so it lies only 1–8 ms on the chain. That is why skipping a third of the draws (the shadow maps) changed nothing.
+- Its time is mostly in parallel, so it lies only 1â€“8 ms on the chain. That is why skipping a third of the draws (the shadow maps) changed nothing.
 - In the timing run (lists one at a time), about 85% of the card's time is the title's translated lists. Our own lists are the other ~15%: preludes refreshing copies (8 ms) and compares (2.6 ms) of 72 ms.
-- The "card ~9.5 ms" figure used earlier is outdated. A Series S renders this scene within 33 ms on a GPU several times slower, so ~24 ms of title work here suggests the translated GPU work is 2–3× slower than it should be. That is not proven yet; per-command times need `VICTORY_GPU_TIMING=1` with `VICTORY_D3D12_DRED=1`.
+- The "card ~9.5 ms" figure used earlier is outdated. A Series S renders this scene within 33 ms on a GPU several times slower, so ~24 ms of title work here suggests the translated GPU work is 2â€“3Ã— slower than it should be. That is not proven yet; per-command times need `VICTORY_GPU_TIMING=1` with `VICTORY_D3D12_DRED=1`.
 
+**The card, follow-up (same evening):**
+- **Per command** (`VICTORY_GPU_TIMING=1` with `VICTORY_D3D12_DRED=1`, lists one at a time): 1,580 kinds of commands with no hot one. By kind, per frame: ExecuteIndirect 17.9 ms in 10,126 commands, dispatches 11.5 ms in 1,583, mesh draws 3.5 ms, plain draws 1.6 ms.
+- **Barriers:** the title's barrier groups are 1,006 full waits for earlier shader writes a frame. Dropping all of them (`VICTORY_BARRIER_TEST=groups` or `both`, timing only) left the card at 26–28 ms busy a frame against 27–28. So barriers are not what the card spends its time on.
+
+**The pool committed** (`VICTORY_POOL_COMMIT=1`, new):
+- The game runs as before, and port 1 still places 544 MB.
+- The census sees the four sections (220, 297, 185 and 3,977 MB) as committed, so they can be opened as one heap each.
+- The probe opens a committed section in 72 ms per GB. The card copies 1 GB out of it in 40 ms, the same speed as today's shared buffers (37.5 ms).
 **What it means:**
-- **30 fps:** our ~15–20 ms on the chain and the wake-up delays come out with the core rebuild, which leaves the game's 13–18 ms plus the card. 30 looks reachable without changing the game. The card at 28 ms standing is close to the 33 ms limit, though.
+- **30 fps:** our ~15â€“20 ms on the chain and the wake-up delays come out with the core rebuild, which leaves the game's 13â€“18 ms plus the card. 30 looks reachable without changing the game. The card at 28 ms standing is close to the 33 ms limit, though.
 - **60 fps (16.7 ms), three walls:**
-  - **The game's main thread:** ~17–20 ms of its own code at today's load. Freeing the four cores our list translation takes may shorten it; how much is unknown.
-  - **The card:** 28 ms standing, so it needs to be about 2× faster.
+  - **The game's main thread:** ~17â€“20 ms of its own code at today's load. Freeing the four cores our list translation takes may shorten it; how much is unknown.
+  - **The card:** 28 ms standing, so it needs to be about 2Ã— faster.
   - **Our layer:** it must be completely off the chain.
 
 ## Where a frame goes (2026-11-27)
@@ -48,7 +56,7 @@ All of this was measured on the PC in the [README](../README.md): Ryzen 7 9800X3
 **Before VIopus (cool_fox, city street, about 12,000 draws, 18 fps):**
 
 - **The game's main thread** is busy only 42% of the time, about 23 ms of a 54 ms frame. Of that, 89% is the game's own code. The layer's code inside it, write traps included, is under 3%.
-- **The rest of the frame the game waits**, 13–16 ms of it at presents, for the queue of about 16 submissions behind the layer's submit thread.
+- **The rest of the frame the game waits**, 13â€“16 ms of it at presents, for the queue of about 16 submissions behind the layer's submit thread.
 - **The submit thread works 47.5 ms a frame:**
 
   | Part | ms per frame |
@@ -59,19 +67,19 @@ All of this was measured on the PC in the [README](../README.md): Ryzen 7 9800X3
   | Asking the write watch | 3.6 |
   | Planning steps on the card | 3.5 |
 
-  The thread is only about 40–56% busy; the rest is spent handing work to helper threads and waiting for them.
-- **What the memory columns mean:** in the copy statistics, `memory 0x40000` is `MEM_MAPPED`, the title's page pool, and `0x20000` is `MEM_PRIVATE`. The biggest per-frame streams are pool memory. The largest is the 174 MB graphics heap, which was copied on the card 10–11 times a frame, once per submission.
+  The thread is only about 40â€“56% busy; the rest is spent handing work to helper threads and waiting for them.
+- **What the memory columns mean:** in the copy statistics, `memory 0x40000` is `MEM_MAPPED`, the title's page pool, and `0x20000` is `MEM_PRIVATE`. The biggest per-frame streams are pool memory. The largest is the 174 MB graphics heap, which was copied on the card 10â€“11 times a frame, once per submission.
 - **The audio thread** spends about 25% of its time in the layer's APU Opus decoding. It is not on the frame's critical path.
 
 **After VIopus in-place memory:**
 
-- The submit thread drops to 24–33 ms a frame, and the game waits 0 ms at presents.
+- The submit thread drops to 24â€“33 ms a frame, and the game waits 0 ms at presents.
 - The card is about 69% busy. It sits idle about 15 ms a frame, 12 ms of that because the game had not submitted yet.
 - **A 4-frame timeline** (`VICTORY_TIMELINE`) shows the critical path spread out: the card running submissions about 9.5 ms, list translation about 14 ms, the game's own code, and frames that vary from 28 to 60 ms.
 
 ## The padding leak (2026-11-26)
 
-- **The symptom:** a 53-minute session ran at 21–22 fps for half an hour, then 8–10 fps. The game had 40 GB private, 0 MB of RAM free, 12,000–21,000 pages a second read back from disk, and system commit at 66.6 of 67.6 GB.
+- **The symptom:** a 53-minute session ran at 21â€“22 fps for half an hour, then 8â€“10 fps. The game had 40 GB private, 0 MB of RAM free, 12,000â€“21,000 pages a second read back from disk, and system commit at 66.6 of 67.6 GB.
 - **The diagnosis:** the diagnostics build's memory map showed the process heap growing from 0.9 to 9.5 GB. The memory line showed "distinct views kept" at 28.8 million, and "shapes of placed views kept" at exactly 4,194,304, the 22-bit cap.
 - **Which words vary:** a per-word count of distinct values across the shapes showed the varying words were padding:
   - `D3D12_RESOURCE_DESC` words 1 and 13;
