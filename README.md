@@ -1,168 +1,141 @@
-# VIctory on an RX 7900 XTX
+# VIopus
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A personal fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs an Xbox Series title on Windows from files you supply. VIopus is tuned for an **AMD Ryzen + Radeon RX 9070 XT** PC. The goal is a stable 30 fps in the open world, the title's own cap, from real rendered frames only (no frame generation).
 
-## The goal
+> [!IMPORTANT]
+> **Measured on one PC only.** Every number here comes from this machine:
+>
+> | Part | |
+> |---|---|
+> | CPU | AMD Ryzen 7 9800X3D (8 cores, 16 threads) |
+> | GPU | AMD Radeon RX 9070 XT, 16 GB (RDNA4) |
+> | RAM | 32 GB DDR5-6000 |
+> | Board | Gigabyte B850M EAGLE WIFI6E ICE, BIOS F5 |
+> | OS | Windows 11 Home |
+>
+> **BIOS: turn off X3D Turbo Mode.** On Gigabyte boards, *X3D Turbo Mode* disables SMT. Windows then shows 8 logical processors instead of 16, even when the BIOS item *SMT Control* is set to *Auto*. The layer needs those threads: with 16 logical processors it was about 15% faster here, and before that the CPU was saturated. Check in Task Manager → Performance → CPU that it says **16 logical processors**. You can turn X3D Turbo Mode back on for other games.
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+**This repository contains no game files, code or assets.** You need your own copy of the title. VIopus is not affiliated with or endorsed by the title's developer or publisher.
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+## Where it stands (2026-11-27)
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+These runs use the Series S profile and the same test save: a city street at noon, about 12,000 draws a frame standing. Each run is 90 s standing, then 90 s running on foot (about 7,000 draws a frame), using `tools\bench7.ps1`. The test save is reset before every run, so the place and hour are always the same. Runs of the same build on different days differ by 1.5–4 fps, so treat small differences as noise.
 
-## Where it stands (2026-11-26)
+| Build (all with the VIopus leak fix) | Standing | On foot | Submit thread (ms/frame) | Lowest free RAM |
+|---|---|---|---|---|
+| [Vice-Tay](https://github.com/TaynanGT/Vice-Tay), AMD profile | 16.6 fps | 17.7 fps | 50.7 | 0.8 GB |
+| [Belobug rx9070xt](https://github.com/Belobug/VIctory-Belobug-AMD/tree/rx9070xt), as shipped | 17.0 fps | 16.0 fps | 44.6 | 1.8 GB |
+| [cool_fox](https://github.com/codec-d/cool_fox) (`pareto-residency`) | 18.2 fps | 19.5 fps | 47.5 | 3.1 GB |
+| Belobug rx9070xt + renderer ports 1, 2, 5, 6, 7 | 19.7–21.2 fps | 18.2–22.5 fps | 38.0–48.6 | 0.5–1.3 GB |
+| **VIopus** (ports + in-place memory) | **22.6–23.4 fps** | **24.4–29.2 fps** | **24–33** | **3.0 GB** |
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
+Other measurements on this PC:
 
-| | |
+- **VIopus while driving fast**, played by hand for 8 minutes: 21.7 fps on average, a median of 22.3, the slowest 10% of samples below 16.7, and about 7,300 draws a frame. The run crashed after 10.5 minutes (see *Known problems*).
+- **VIopus on foot for 30 minutes**, automated: no crash, with memory flat at 27–28 GB private. It ran at 28–30.6 fps through town (5,500–8,000 draws), and a steady 30.0 fps in light scenes.
+- **[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) as shipped:** 12.2 fps (83 ms a frame) on an earlier city save where cool_fox did 20.7 fps. Its renderer ports crashed AMD's shader compiler at boot until Belobug added the compiler-crash guard.
+- **Belobug-AMD `main`** (2026-11-26): 5–7 fps in the open world.
+
+The numbers mean the following:
+
+- *Submit thread* is the layer's thread that prepares each submission for the card. It was the wall before VIopus; the title waits for it at every present.
+- In the busiest street the title's own main thread is busy only about 23 ms of a frame, so 30 fps is possible. The remaining time is spread over the card (about 9.5 ms), translating the title's command lists (about 14 ms), and occasional spikes of up to 60 ms.
+
+## What VIopus changed, and the proof
+
+1. **Memory leak in the descriptor views fixed**, [`crates/victory-gpu/src/descriptor.rs`](crates/victory-gpu/src/descriptor.rs) (`tidy_resource`, `tidy_view`).
+   - **The bug:** the title leaves padding in its resource and view descriptions uninitialized. That is stack garbage, different on every call. The layer interned views by every word, so the same view written twice became two entries.
+   - **The effect:** the placed-view "shapes" table hit its 4,194,304 cap after about 18 minutes, and from then on every placed view became a table entry that is never freed. One 53-minute session reached 28.8 million entries (11 GB). RAM ran out and fps fell from 21 to 8.
+   - **The fix:** the padding words are zeroed before interning. Shapes now grow about 20 a second instead of 5,000–9,000. Over a 45-minute run the heap went from 1.61 to 1.88 GB and levelled off, and fps stayed at 18–28 without collapsing.
+   - [Vice-Tay](https://github.com/TaynanGT/Vice-Tay) found and fixed the same leak independently.
+   - `VICTORY_VIEW_TIDY=0` turns the fix off.
+2. **The card reads the title's memory in place**, [`crates/victory-gpu/src/port.rs`](crates/victory-gpu/src/port.rs), `VICTORY_PORT_ALL=1`, used together with `VICTORY_INPLACE=2`.
+   - **Before:** renderer port 1 (VIctory-7900XTX) already let the card read the title's 32-bit graphics heap in place, but only memory below 4 GiB qualified.
+   - **The change:** VIopus lifts that limit. Every title buffer or window that is one committed stretch of a section is used where the title has it, with no host copy, no write tracking and no copy-back.
+   - **The reason:** the bytes themselves are small, about 115 MB up and 30 MB back a frame, which is about 6 ms of raw bus time. The ~30 ms was the bookkeeping that keeps two copies in step.
+   - **The result:** the submit thread dropped from 48.6 to 24–33 ms a frame, and fps rose 10–30% over the same build without it.
+   - **The limit:** the card cannot follow scattered 64 KiB pages. Tile mappings into a heap opened from the title's memory remove the device. So pages must form one stretch to qualify.
+3. **No 300–800 ms freezes while new pipelines compile**: `VICTORY_PIPELINE_WAIT_MS=10`, set in `tools\settings.cmd`.
+   - **Before:** a frame waited up to 500 ms for a pipeline still compiling, and the worst frames measured exactly 500.8 ms.
+   - **Now:** a new effect shows a frame or two late instead. Play feels much smoother with less input lag.
+4. **SMT on** (BIOS X3D Turbo Mode off; see the note at the top): about +15%.
+5. **AMD shader-compiler crashes survived.**
+   - **The problem:** AMD's RDNA4 compiler crashes at `amdxc64.dll+0x861b9f` on some pipelines. Before any fix, this killed every run within 7–15 minutes.
+   - **cool_fox / Vice-Tay:** a skip list, `warm-bad.txt`, held in `pipeline/library.rs` (`known_bad`), held up for 98 minutes with no crash.
+   - **VIopus:** Belobug's compiler-crash guard catches these crashes at run time, so the skip list isn't needed here.
+6. **Faster locks in the descriptor heap host** (cool_fox only, about 5–7%). This patch is kept for reference in [`docs/patches/cool_fox-local-changes.patch`](docs/patches/cool_fox-local-changes.patch) and is not yet ported to VIopus.
+
+### Tried and measured, no gain on this PC
+
+- **System settings:** Windows power plan, process and helper-thread priorities, CPU affinity layouts, spinning thread pools.
+- **Thread counts and build:** `VICTORY_THIN_THREADS` of 4, 6 or 12; `VICTORY_WIDE_THREADS=8`; thin LTO with `codegen-units=1`.
+- **Other switches:** `VICTORY_HEAP_SYNC_EARLY`, `VICTORY_JOIN_PARTS=32`, `VICTORY_SUBMIT_FRAMES=2`.
+- **Smaller memory windows:** `VICTORY_WINDOW_KB` 256 or 64 put up to 3.5 GB in place, but fps didn't change and the layer kept rebuilding regions.
+- **Moving the game data from D: to C:**, both NVMe drives.
+- **The title's own graphics settings:** they have no performance options.
+- **Frame generation was left out on purpose:** generated frames are not rendered frames.
+
+## Known problems
+
+- **A crash after 10.5 minutes of fast driving** with in-place memory on. The title's code read a garbage pointer (`0xffffffffffffffff`) while walking data at the start of the in-place graphics heap. There are two suspects, not yet separated: in-place memory itself, or a compute pipeline that the compiler-crash guard had left out three minutes earlier. To compare, run with `set VICTORY_PORT_ALL=0` and `set VICTORY_INPLACE=0`.
+- **Ragged dark speckle** along the left and right window edges.
+- **32 GB of RAM is tight:** the game uses 23–28 GB of private memory. Close browsers before playing.
+- **The title caps at 30 fps.** Upstream's `VICTORY_FRAME_INTERVAL_MS=16.667` lifts the cap, but that has not been tested here.
+
+## How to run
+
+1. Install Rust: the toolchain is pinned in `rust-toolchain.toml`, and `rustup` fetches it. You also need the MSVC build tools with a Windows SDK.
+2. Build the diagnostics build, which all the numbers above are of:
+   ```powershell
+   cargo build --locked --profile diag -p victory --features diagnostics
+   ```
+3. Tell VIopus where your copy of the game is. Create `local.cmd` next to this README; git ignores it:
+   ```bat
+   @echo off
+   set "VICTORY_GAME_DIR=D:\path\to\your\game"
+   ```
+4. Translate the shaders once. This takes about 80 s:
+   ```powershell
+   $env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\VIctory\cache-viopus"
+   .\target\diag\victory.exe shaders "D:\path\to\your\game\shaders.rpf"
+   ```
+5. Run `Play-VIopus.cmd` and press Enter at the title screen.
+   - It snapshots your saves before and after the game, with `tools\backup-saves.ps1`.
+   - It writes the log to `logs\play.log`.
+   - To change a setting, set it before you start; see `tools\settings.cmd`.
+
+All forks of VIctory share one save folder, `%LOCALAPPDATA%\victory\data`. Back it up before switching forks: `tools\backup-saves.ps1` makes verified, read-only, timestamped snapshots and never deletes anything.
+
+## Tools (`tools/`)
+
+| File | What it does |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
-
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
-
-### Renderer patches (off by default while they are tested)
-
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
-
-### Other switches
-
-| Switch | What it does |
-|---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
-
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
-
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
-`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
-`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
-`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
-
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
-the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
-and `performance` selects 1920×1080. All three output 3840×2160. With
-`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
-The log reports the provider at context creation and the actual input and
-output sizes at the first successful temporal dispatch. The title profile
-and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
-
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
-
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+| `settings.cmd` | The default settings, shared by both launchers |
+| `play-test.cmd` | Launcher for automated runs |
+| `gk.ps1` | Game helper. `launch [NAME=VALUE;...]` presses Enter by itself. `GK_TESTDATA=1` uses a fresh copy of `tools\testdata-template` instead of your saves; make the template from a save of your own. Also `shot`, `key`, `keys`, `status` and `stop`. Keys and screenshots only go to the game window while it is in front. |
+| `bench7.ps1` | A/B benchmark on the test save: standing, then running; fps, frame time, draws, private memory, free RAM |
+| `longrun.ps1` | A long run on foot with memory and fps every minute, to catch leaks |
+| `recorder.ps1` | Records fps, memory and screenshots while you play. It never takes focus and never sends keys. |
+| `sampler.py` | A sampling CPU profiler per thread, using `dbghelp` and the build's `.pdb` |
+| `backup-saves.ps1` | Save snapshots to `D:\` and `E:\` by default; use `-Roots` to change |
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+VIopus is other people's work with a few changes on top. The full history is kept, so every commit still names its author.
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors: the loader, the runtime services, the Direct3D 12 back end and the shader recompiler.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: the `rx9070xt` branch VIopus is built on. It brought the RX 9070 XT fixes, the AMD compiler-crash guard, texture uploads in the submission prelude, the FSR 4 bridge, the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: the "porting, not emulating" renderer ports 1, 2, 5, 6 and 7. Port 1, the title's graphics heap read in place, is what `VICTORY_PORT_ALL` extends.
+- **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)**: the `pareto-residency` fork. It was the best build on this PC until VIopus, and many measurements here were made on it.
+- **[TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay)**: independently found the same padding leak, and the frame generation bridge.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes, cube gradients, sparse textures, and the PC FidelityFX bridge.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork upstream started from, and submissions prepared on a thread of their own (`VICTORY_ASYNC_SUBMIT`).
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's reads into title memory.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same title behaves under another layer. No code from it is here.
+- The VIopus measurements and changes were made by edckis with [Claude Code](https://claude.com/claude-code). The upstream README is kept in [`docs/UPSTREAM-README.md`](docs/UPSTREAM-README.md), and a longer log of findings is in [`docs/viopus-findings.md`](docs/viopus-findings.md).
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, the same as VIctory. See [LICENSE](LICENSE). The one file it does not cover is named in [docs/asset-policy.md](docs/asset-policy.md).

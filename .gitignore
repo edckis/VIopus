@@ -76,3 +76,16 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# VIopus: local files that stay on this PC
+/local.cmd
+/logs/
+/tools/gk.err
+/tools/gk.out
+/tools/*.err
+/tools/bench7-*.txt
+/tools/bench7-*.csv
+/tools/rec/
+/tools/cur/
+/tools/testdata/
+/tools/testdata-template/

@@ -1,0 +1,986 @@
+﻿diff --git a/Cargo.toml b/Cargo.toml
+index 4e21b69..3b100bb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -71,6 +71,10 @@ opt-level = 2
+ 
+ [profile.release]
+ debug = "line-tables-only"
++# Local change (from VIctory-Belobug-AMD #96): one codegen unit and thin LTO, so
++# the per-draw paths inline across crates; slower to build.
++lto = "thin"
++codegen-units = 1
+ 
+ # The development build: release code generation plus the `diagnostics`
+ # feature (`cargo build --profile diag -p victory --features diagnostics`),
+diff --git a/Play-VIctory.cmd b/Play-VIctory.cmd
+index 38410dd..1ff95e3 100644
+--- a/Play-VIctory.cmd
++++ b/Play-VIctory.cmd
+@@ -35,6 +35,9 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
+ if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
+ if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
+ if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
++rem Local change 2026-11-26: a frame waits at most 10 ms (not 500) for a pipeline still compiling;
++rem a new effect shows a frame or two late instead of freezing the picture (spikes up to 500 ms).
++if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=10"
+ if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
+ "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute
+ exit /b %errorlevel%
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 9c3cc2e..de460fa 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -968,9 +968,41 @@ impl Views {
+         let at = self.shapes.len() as u32;
+         self.shapes.push(shape);
+         self.shape_index.insert(shape, at);
++        #[cfg(feature = "diagnostics")]
++        if matches!(self.shapes.len(), 4096 | 16384 | 65536 | 262144) {
++            self.log_shapes();
++        }
+         Some(at)
+     }
+ 
++    /// Local patch (diagnostics): which words of the placed views' shapes
++    /// differ, over the shapes kept so far (distinct values per word), and a
++    /// few of the newest shapes, to see what makes shapes many.
++    #[cfg(feature = "diagnostics")]
++    fn log_shapes(&self) {
++        let words = |s: &Shape| -> [u32; 29] {
++            let mut w = [0u32; 29];
++            w[0] = u32::from(s.0);
++            w[1..15].copy_from_slice(&s.1);
++            w[15..].copy_from_slice(&s.2);
++            w
++        };
++        let mut distinct: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); 29];
++        for s in &self.shapes {
++            for (set, w) in distinct.iter_mut().zip(words(s)) {
++                if set.len() < 100_000 {
++                    set.insert(w);
++                }
++            }
++        }
++        let counts: Vec<String> = distinct.iter().enumerate().map(|(i, s)| format!("{i}:{}", s.len())).collect();
++        tracing::info!("SHAPES {} kept; distinct values per word (0 unordered, 1-14 resource, 15-28 view): {}", self.shapes.len(), counts.join(" "));
++        for s in self.shapes.iter().rev().take(12) {
++            let w: Vec<String> = words(s).iter().map(|w| format!("{w:08x}")).collect();
++            tracing::info!("SHAPE {}", w.join(" "));
++        }
++    }
++
+     /// The view of placed memory [`placed_words`] named.
+     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
+         let payload = payload(i, generation);
+@@ -1291,6 +1323,76 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
+ }
+ 
++/// Local fix (2026-11-26): the title's descriptions carry padding it never
++/// sets (stack bytes: values like 0x3e66e1bc or 0x7ffd that differ from call
++/// to call): the resource description's words 1 (before the 64-bit
++/// alignment) and 13 (after the flags), the shader view's word 3 (before its
++/// 64-bit-aligned union), and the words of the union its dimension leaves
++/// unused. Views are kept by every word ([`Views`]), so the same view written
++/// twice was two views: a run of 50 minutes kept 4,194,304 shapes of placed
++/// views (all there is room for) after 18 minutes, then 28.8 million table
++/// entries (11 GB) that are never let go, and the PC ran out of memory.
++/// These words are zeroed (the host reads none of them). `VICTORY_VIEW_TIDY=0`
++/// keeps them as the title wrote them.
++fn tidy() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_TIDY").is_none_or(|v| v != "0"))
++}
++
++/// Zeroes the padding of a resource description in the host's layout
++/// (`D3D12_RESOURCE_DESC`, 56 bytes).
++fn tidy_resource(resource: &mut [u32; 14]) {
++    if tidy() {
++        resource[1] = 0;
++        resource[13] = 0;
++    }
++}
++
++/// Zeroes the words of a view description in the host's layout
++/// (`D3D12_SHADER_RESOURCE_VIEW_DESC` or `D3D12_UNORDERED_ACCESS_VIEW_DESC`,
++/// 40 bytes) that its dimension does not use: padding, and what the union
++/// holds past its member.
++fn tidy_view(unordered: bool, desc: &mut [u32]) {
++    if !tidy() || desc.len() < 10 {
++        return;
++    }
++    // The first word past what the dimension's member uses.
++    let end = if unordered {
++        // Format, dimension, then the union from word 2.
++        match desc[1] {
++            1 => 9,     // buffer: first element (2 words), count, stride, counter offset (2), flags
++            2 => 3,     // 1D: mip
++            3 => 5,     // 1D array: mip, first slice, slices
++            4 => 4,     // 2D: mip, plane
++            5 => 6,     // 2D array: mip, first slice, slices, plane
++            6 => 2,     // 2D multisampled: nothing
++            7 => 4,     // 2D multisampled array: first slice, slices
++            8 => 5,     // 3D: mip, first depth slice, depth slices
++            _ => return, // unknown or Xbox-only: as written
++        }
++    } else {
++        // Format, dimension, component mapping, padding, then the union
++        // from word 4.
++        desc[3] = 0;
++        match desc[1] {
++            1 => 9,      // buffer: first element (2 words), count, stride, flags
++            2 => 7,      // 1D: top mip, mips, LOD clamp
++            3 => 9,      // 1D array: top mip, mips, first slice, slices, LOD clamp
++            4 => 8,      // 2D: top mip, mips, plane, LOD clamp
++            5 => 10,     // 2D array: all six
++            6 => 4,      // 2D multisampled: nothing
++            7 => 6,      // 2D multisampled array: first slice, slices
++            8 | 9 => 7,  // 3D, cube: top mip, mips, LOD clamp
++            10 => 9,     // cube array: top mip, mips, first face, cubes, LOD clamp
++            11 => 6,     // ray-tracing structure: its address (2 words)
++            _ => return,
++        }
++    };
++    for w in &mut desc[end..10] {
++        *w = 0;
++    }
++}
++
+ /// Device method.
+ pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+     if let Some([lo, hi, size, _]) = words(desc) {
+@@ -1306,7 +1408,11 @@ pub(crate) extern "system" fn create_srv(
+     desc: *const [u32; 10],
+     handle: u64,
+ ) {
+-    record(handle, View::Shader(resource as usize, words(desc)));
++    let mut desc = words(desc);
++    if let Some(d) = desc.as_mut() {
++        tidy_view(false, d);
++    }
++    record(handle, View::Shader(resource as usize, desc));
+ }
+ 
+ /// Device method.
+@@ -1317,7 +1423,11 @@ pub(crate) extern "system" fn create_uav(
+     desc: *const [u32; 10],
+     handle: u64,
+ ) {
+-    let view = View::Unordered(resource as usize, counter as usize, words(desc));
++    let mut desc = words(desc);
++    if let Some(d) = desc.as_mut() {
++        tidy_view(true, d);
++    }
++    let view = View::Unordered(resource as usize, counter as usize, desc);
+     record(handle, view);
+ }
+ 
+@@ -1330,7 +1440,9 @@ pub(crate) extern "system" fn create_placed_srv(
+     desc: *const [u32; 16],
+     handle: u64,
+ ) {
+-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
++    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
++        tidy_resource(&mut resource);
++        tidy_view(false, &mut desc[..10]);
+         record(handle, View::Placed(false, resource, desc));
+     }
+ }
+@@ -1341,7 +1453,9 @@ pub(crate) extern "system" fn create_placed_uav(
+     desc: *const [u32; 16],
+     handle: u64,
+ ) {
+-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
++    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
++        tidy_resource(&mut resource);
++        tidy_view(true, &mut desc[..10]);
+         record(handle, View::Placed(true, resource, desc));
+     }
+ }
+@@ -1545,6 +1659,44 @@ static FUNCTIONS: Table<24> = {
+     Table(f)
+ };
+ 
++#[cfg(test)]
++mod tidy_tests {
++    use super::*;
++
++    /// Padding the title leaves as stack bytes is zeroed; what the view
++    /// uses is kept, so two writes of one view are one shape.
++    #[test]
++    fn padding_is_zeroed_and_used_words_kept() {
++        // A buffer shader view with garbage in words 3 and 9.
++        let mut a = [39, 1, 0x1688, 0x0e3f_8d00, 0, 0, 200, 0, 1, 0x3ea8_0210];
++        let mut b = [39, 1, 0x1688, 0x0000_000f, 0, 0, 200, 0, 1, 0x0000_0009];
++        tidy_view(false, &mut a);
++        tidy_view(false, &mut b);
++        assert_eq!(a, [39, 1, 0x1688, 0, 0, 0, 200, 0, 1, 0]);
++        assert_eq!(a, b);
++        // A 2D array shader view uses the whole union.
++        let mut arr = [28, 5, 0x1688, 7, 1, 2, 3, 4, 5, 6];
++        tidy_view(false, &mut arr);
++        assert_eq!(arr, [28, 5, 0x1688, 0, 1, 2, 3, 4, 5, 6]);
++        // A 2D shader view: words 8 and 9 are past its member.
++        let mut t = [28, 4, 0x1688, 0, 0, 9, 0, 0, 0xdead, 0xbeef];
++        tidy_view(false, &mut t);
++        assert_eq!(t, [28, 4, 0x1688, 0, 0, 9, 0, 0, 0, 0]);
++        // An unordered buffer view: no padding before the union, word 9 after.
++        let mut u = [42, 1, 0, 0, 0x116e, 0, 0, 0, 0, 0x18f];
++        tidy_view(true, &mut u);
++        assert_eq!(u, [42, 1, 0, 0, 0x116e, 0, 0, 0, 0, 0]);
++        // An unknown dimension is left as written (but for the shader view's word 3).
++        let mut x = [1, 0x40, 2, 3, 4, 5, 6, 7, 8, 9];
++        tidy_view(true, &mut x);
++        assert_eq!(x, [1, 0x40, 2, 3, 4, 5, 6, 7, 8, 9]);
++        // The resource description's two padding words.
++        let mut r = [1, 0x3e66_e1bc, 0, 0, 0x320, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0x3f6a_dbf6];
++        tidy_resource(&mut r);
++        assert_eq!(r, [1, 0, 0, 0, 0x320, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0]);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1734,8 +1886,12 @@ mod tests {
+         let slots = [0u64; 4];
+         let at = slots.as_ptr() as u64;
+         // A resource description and a view no other test uses.
+-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
++        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
++        // Padding is zeroed when recorded ([`tidy`]): expect the tidied words.
++        tidy_resource(&mut resource);
++        tidy_view(false, &mut desc[..10]);
++        tidy_view(true, &mut desc[..10]);
+         let mine = |v: &View| match v {
+             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
+             View::Placed(_, r, _) => *r == resource,
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 176970b..b3bc274 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -157,6 +157,9 @@ pub(crate) struct HostHeap {
+     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
+     /// made for a draw takes it, and lets go of what the slot held under it).
+     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
++    /// Local patch: the raw pointer each `kept` slot holds (0: none), read
++    /// without its lock by [`HostHeap::keep`]; written under it.
++    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
+     /// Where the search for free dynamic slots starts, and which are taken
+     /// (by lists not yet reset).
+     next: Mutex<(u32, Vec<bool>)>,
+@@ -194,6 +197,16 @@ pub(crate) struct HostHeap {
+     /// table; one a shader picks by a computed index is brought up to date
+     /// from here ([`HostHeap::texture_slots_due`]).
+     textures: Mutex<TextureQueue>,
++    /// Local patch: per title slot, whether `textures` may hold it. Set before
++    /// every insert (under its lock), cleared after a remove (under it): a
++    /// write of a buffer view into a slot the queue does not hold then takes
++    /// no lock (the heap pass and the recording threads queued on it).
++    queued: Box<[std::sync::atomic::AtomicBool]>,
++    /// Local patch: per title slot, whether `placed` may hold it (only
++    /// [`HostHeap::note_buffer`] adds or forgets slots there): a write of a
++    /// view that is no placed texture into a slot it does not hold takes no
++    /// lock.
++    spanned: Box<[std::sync::atomic::AtomicBool]>,
+     /// Per title slot, the frame (plus one; 0: never) in which a draw last
+     /// read it through a table, or made a table it lies in (with
+     /// [`TABLED_READ`] set if the draw read it). The draw that
+@@ -1611,6 +1624,7 @@ impl HostHeap {
+             waiting: Mutex::default(),
+             away: Mutex::default(),
+             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
++            kept_raw: (0..count + extra).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
+             next: Mutex::new((0, vec![false; extra as usize])),
+             free: std::sync::atomic::AtomicU32::new(extra),
+             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+@@ -1618,6 +1632,8 @@ impl HostHeap {
+             buffers: Slots::new(count as usize),
+             changed: Slots::new(count as usize),
+             textures: Mutex::default(),
++            queued: (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
++            spanned: (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+             tabled: (0..if sampler { 0 } else { count })
+                 .map(|_| std::sync::atomic::AtomicU32::new(0))
+                 .collect(),
+@@ -1906,7 +1922,8 @@ impl HostHeap {
+         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         for &slot in &slots {
+-            textures.changed(slot, frame, frame + 1);
++            self.mark_queued(slot);
++            textures.changed(slot, frame,frame + 1);
+         }
+         STALE[3].fetch_add(slots.len() as u64, Relaxed);
+         slots.len()
+@@ -1931,7 +1948,8 @@ impl HostHeap {
+         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         for &slot in &slots {
+-            textures.changed(slot, frame, frame + 1);
++            self.mark_queued(slot);
++            textures.changed(slot, frame,frame + 1);
+         }
+         slots.len()
+     }
+@@ -1992,7 +2010,8 @@ impl HostHeap {
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+         for &slot in &slots {
+-            textures.changed(slot, frame, frame);
++            self.mark_queued(slot);
++            textures.changed(slot, frame,frame);
+         }
+         slots.len()
+     }
+@@ -2020,7 +2039,8 @@ impl HostHeap {
+             return [held, slots.len(), 0];
+         }
+         for &slot in &slots {
+-            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
++            self.mark_queued(slot);
++            textures.changed(slot, frame,frame + PAGE_WRITE_AFTER);
+         }
+         [held, slots.len(), slots.len()]
+     }
+@@ -2102,7 +2122,8 @@ impl HostHeap {
+         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         for &slot in &slots {
+-            textures.changed(slot, frame, frame + 1);
++            self.mark_queued(slot);
++            textures.changed(slot, frame,frame + 1);
+         }
+         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
+         slots.len()
+@@ -2150,7 +2171,7 @@ impl HostHeap {
+             };
+             if let Some(kept) = make(&view, self.at(slot)) {
+                 self.put(slot);
+-                self.keep(slot, kept);
++                self.keep(slot, kept.as_ref());
+                 remade += 1;
+             }
+         }
+@@ -2262,7 +2283,7 @@ impl HostHeap {
+                 self.put(index);
+                 self.clear_twin(index);
+                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
+-                self.keep(index, kept);
++                self.keep(index, kept.as_ref());
+             }
+             stale
+         };
+@@ -2431,7 +2452,7 @@ impl HostHeap {
+                 self.quick_is(index, 0);
+                 self.clear_twin(index);
+                 self.made.set(index, key);
+-                self.keep(index, kept);
++                self.keep(index, kept.as_ref());
+                 (true, stale)
+             } else {
+                 (false, stale)
+@@ -2495,7 +2516,7 @@ impl HostHeap {
+                 let was = shown;
+                 self.quick_is(f.index, 0);
+                 self.made.set(f.index, f.key);
+-                self.keep(f.index, kept);
++                self.keep(f.index, kept.as_ref());
+                 #[cfg(feature = "diagnostics")]
+                 if f.late.is_some() && was != 0 {
+                     same_bytes(was, f.key);
+@@ -2631,17 +2652,38 @@ impl HostHeap {
+         // Made now by a draw of this frame that read it through a table:
+         // up to date.
+         let read_now = seen && stamp == now | TABLED_READ;
++        let queued = self.queued.get(index as usize);
++        if !(texture && !read_now) {
++            // A removal from a queue that does not hold the slot: nothing to
++            // do, and no lock to take.
++            if queued.is_some_and(|q| !q.load(std::sync::atomic::Ordering::Acquire)) {
++                return;
++            }
++            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++            textures.remove(index);
++            if let Some(q) = queued {
++                q.store(false, std::sync::atomic::Ordering::Release);
++            }
++            return;
++        }
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+-        if texture && !read_now {
+-            let due = if lately && !seen {
+-                TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-                frame + TABLED_GRACE
+-            } else {
+-                0
+-            };
+-            textures.written(index, frame, due, seen);
++        let due = if lately && !seen {
++            TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            frame + TABLED_GRACE
+         } else {
+-            textures.remove(index);
++            0
++        };
++        if let Some(q) = queued {
++            q.store(true, std::sync::atomic::Ordering::Release);
++        }
++        textures.written(index, frame, due, seen);
++    }
++
++    /// Notes that `textures` may hold title slot `index` from now on (called
++    /// under its lock, before the insert).
++    fn mark_queued(&self, index: u32) {
++        if let Some(q) = self.queued.get(index as usize) {
++            q.store(true, std::sync::atomic::Ordering::Release);
+         }
+     }
+ 
+@@ -2715,7 +2757,11 @@ impl HostHeap {
+             }
+             _ => None,
+         };
+-        let stale = {
++        let spanned = self.spanned.get(index as usize);
++        let stale = if placed_view.is_none() && spanned.is_some_and(|s| !s.load(std::sync::atomic::Ordering::Acquire)) {
++            // Nothing to forget, and no lock to take.
++            Vec::new()
++        } else {
+             use std::sync::atomic::Ordering::Relaxed;
+             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+             let span = placed_view.and_then(|(resource, start, first, held)| {
+@@ -2723,6 +2769,9 @@ impl HostHeap {
+             });
+             match span {
+                 Some((start, end, first, held)) => {
++                    if let Some(s) = spanned {
++                        s.store(true, std::sync::atomic::Ordering::Release);
++                    }
+                     SPANNED[0].fetch_min(start, Relaxed);
+                     SPANNED[1].fetch_max(end, Relaxed);
+                     placed.rule = stale_rule();
+@@ -2734,6 +2783,9 @@ impl HostHeap {
+                 }
+                 None => {
+                     placed.forget(index);
++                    if let Some(s) = spanned {
++                        s.store(false, std::sync::atomic::Ordering::Release);
++                    }
+                     Vec::new()
+                 }
+             }
+@@ -2801,7 +2853,7 @@ impl HostHeap {
+         self.put(index);
+         self.twin_made(index, kept.is_some() && twinned(view));
+         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
+-        self.keep(index, kept.flatten());
++        self.keep(index, kept.flatten().as_ref());
+     }
+ 
+     /// Makes slot `index` (a dynamic one) the view the record `words` names,
+@@ -2851,7 +2903,7 @@ impl HostHeap {
+                 self.clear_twin(index);
+             }
+             self.write_stride(index, made.stride_word);
+-            self.keep(index, made.kept.clone());
++            self.keep(index, made.kept.as_ref());
+             Some(made.listed)
+         })
+     }
+@@ -2909,18 +2961,35 @@ impl HostHeap {
+     }
+ 
+     /// Slot `index` now views `resource` (or nothing of the host's).
+-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
++    ///
++    /// Local patch: the same resource again (most calls) is seen in
++    /// `kept_raw` with no lock and no reference count taken; a slot's
++    /// writers are one at a time already (a title slot under `made`'s lock,
++    /// a dynamic one is its list's).
++    fn keep(&self, index: u32, resource: Option<&ID3D12Resource>) {
++        use windows::core::Interface;
+         let Some(slot) = self.kept.get(index as usize) else {
+             return;
+         };
++        let raw = resource.map_or(0, |r| r.as_raw() as usize);
++        let shadow = self.kept_raw.get(index as usize);
++        if shadow.is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == raw) {
++            return;
++        }
+         let old = {
+-            use windows::core::Interface;
+             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+             // The same again: nothing to retire.
+-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
++            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
++                if let Some(k) = shadow {
++                    k.store(raw, std::sync::atomic::Ordering::Release);
++                }
+                 return;
+             }
+-            std::mem::replace(&mut *slot, resource)
++            let old = std::mem::replace(&mut *slot, resource.cloned());
++            if let Some(k) = shadow {
++                k.store(raw, std::sync::atomic::Ordering::Release);
++            }
++            old
+         };
+         // A running submission may still read the old resource through
+         // this slot.
+@@ -2963,7 +3032,7 @@ impl HostHeap {
+         // (Bound by its handle, not read by index.)
+         self.clear_twin(index);
+         self.write_stride(index, 1);
+-        self.keep(index, Some(buffer.clone()));
++        self.keep(index, Some(buffer));
+     }
+ 
+     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
+@@ -3008,7 +3077,7 @@ impl HostHeap {
+         self.put(index);
+         self.clear_twin(index);
+         self.write_stride(index, 1);
+-        self.keep(index, Some(buffer.clone()));
++        self.keep(index, Some(buffer));
+     }
+ 
+     /// Makes slot `index` (a dynamic one) a raw unordered access view of
+@@ -3098,7 +3167,7 @@ impl HostHeap {
+         self.write_stride(index, 0);
+         // After the descriptor: what it showed is let go when nothing shows
+         // it any more.
+-        self.keep(index, holds.then(|| buffer.clone()));
++        self.keep(index, holds.then_some(buffer));
+     }
+ 
+     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
+@@ -3327,7 +3396,7 @@ impl HostHeap {
+                 self.put(index);
+             }
+             self.twin_made(index, kept.is_some() && twinned(&view));
+-            self.keep(index, kept.flatten());
++            self.keep(index, kept.flatten().as_ref());
+             self.quick_is(index, if later { 0 } else { key });
+             drop(held);
+             self.unmake_stale(index, stale);
+diff --git a/crates/victory-gpu/src/frame.rs b/crates/victory-gpu/src/frame.rs
+index 8bf432f..078d13b 100644
+--- a/crates/victory-gpu/src/frame.rs
++++ b/crates/victory-gpu/src/frame.rs
+@@ -79,6 +79,40 @@ pub(crate) extern "system" fn schedule(
+     S_OK
+ }
+ 
++/// Local patch (diagnostics): the time between the title's frame starts,
++/// logged every 10 s as percentiles ("FRAMETIMES"), to tell a steady frame
++/// from one with spikes.
++#[cfg(feature = "diagnostics")]
++fn frame_times() {
++    static STATE: std::sync::Mutex<Option<(Instant, Instant, Vec<u32>)>> = std::sync::Mutex::new(None);
++    let now = Instant::now();
++    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    let (last, logged, times) = state.get_or_insert_with(|| (now, now, Vec::with_capacity(1024)));
++    times.push(now.duration_since(*last).as_micros().min(u128::from(u32::MAX)) as u32);
++    *last = now;
++    if now.duration_since(*logged) >= Duration::from_secs(10) && times.len() > 4 {
++        let mut v = std::mem::take(times);
++        *logged = now;
++        drop(state);
++        v.sort_unstable();
++        let at = |p: f64| f64::from(v[((v.len() - 1) as f64 * p) as usize]) / 1000.0;
++        let over = |ms: u32| v.iter().filter(|&&t| t > ms * 1000).count();
++        let mean = v.iter().map(|&t| f64::from(t)).sum::<f64>() / v.len() as f64 / 1000.0;
++        tracing::info!(
++            "FRAMETIMES {} frames: mean {:.1} ms, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1}; over 34 ms {}, over 50 ms {}, over 100 ms {}",
++            v.len(),
++            mean,
++            at(0.5),
++            at(0.9),
++            at(0.99),
++            at(1.0),
++            over(34),
++            over(50),
++            over(100)
++        );
++    }
++}
++
+ /// Frames begun so far (frame waits that ended).
+ pub(crate) fn current() -> u64 {
+     FRAME.load(Ordering::Relaxed)
+@@ -165,6 +199,8 @@ pub(crate) extern "system" fn wait(
+     }
+     // A frame begun on a time-out takes no tick: its flip still does.
+     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
++        #[cfg(feature = "diagnostics")]
++        frame_times();
+         // Tokens count frames (consecutive), not ticks.
+         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+         if !token.is_null() {
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index aedc396..7936962 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -498,18 +498,135 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
+         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+         parse_skip_hashes(&value)
+     });
+-    if hashes.is_empty() {
++    // Local patch: `VICTORY_SKIP_NAMES=MirrorReflection,CascadeShadows` skips every
++    // pipeline with a shader whose container holds one of these texts (the
++    // shader's name), the answer kept per pipeline.
++    static NAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
++    let names = NAMES.get_or_init(|| {
++        std::env::var("VICTORY_SKIP_NAMES")
++            .unwrap_or_default()
++            .split(',')
++            .map(str::trim)
++            .filter(|n| !n.is_empty())
++            .map(|n| n.as_bytes().to_vec())
++            .collect()
++    });
++    if hashes.is_empty() && names.is_empty() {
+         return None;
+     }
++    if !names.is_empty() {
++        static SEEN: std::sync::RwLock<Option<HashMap<usize, bool>>> = std::sync::RwLock::new(None);
++        let key = std::ptr::from_ref(p) as usize;
++        let known = SEEN.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).copied());
++        let hit = match known {
++            Some(hit) => hit,
++            None => {
++                let hit = p
++                    .shaders
++                    .iter()
++                    .any(|s| names.iter().any(|n| s.container.windows(n.len()).any(|w| w == n.as_slice())));
++                SEEN.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, hit);
++                hit
++            }
++        };
++        if hit {
++            return p.shaders.first().map(|shader| shader.hash.as_str());
++        }
++    }
+     p.shaders
+         .iter()
+         .find(|shader| hashes.contains(&shader.hash))
+         .map(|shader| shader.hash.as_str())
+ }
+ 
++/// Local patch (diagnostics): `VICTORY_COUNT_DRAWS=1` logs every 10 s which
++/// shader names the draws and dispatches are made with, per frame.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn count_draw(p: &Pipeline) {
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    static ON: OnceLock<bool> = OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("VICTORY_COUNT_DRAWS").is_some_and(|v| v == "1")) {
++        return;
++    }
++    static NAMES: std::sync::RwLock<Option<HashMap<usize, Arc<str>>>> = std::sync::RwLock::new(None);
++    static COUNTS: Mutex<Option<HashMap<Arc<str>, u64>>> = Mutex::new(None);
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    static FRAME0: AtomicU64 = AtomicU64::new(0);
++    let key = std::ptr::from_ref(p) as usize;
++    let known = NAMES.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned());
++    let name = match known {
++        Some(n) => n,
++        None => {
++            // The first run of name characters in each container that looks like
++            // a shader name (a prefix, an underscore, capitals): stage letters and
++            // the hash suffix left off.
++            let mut parts: Vec<String> = Vec::new();
++            for s in &p.shaders {
++                let bytes = &s.container;
++                let mut i = 0;
++                let mut found = String::new();
++                while i < bytes.len() && found.is_empty() {
++                    if bytes[i].is_ascii_alphabetic() && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) {
++                        let mut j = i;
++                        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b':') {
++                            j += 1;
++                        }
++                        let run = &bytes[i..j];
++                        const PREFIXES: [&[u8]; 17] = [
++                            b"PS_", b"VS_", b"MS_", b"MSNC_", b"MST", b"CS", b"DS_", b"HS_", b"GS_", b"ps_", b"vs_", b"ptfx_",
++                            b"ptx_", b"TS_", b"AS_", b"SPS_", b"cs_",
++                        ];
++                        if run.len() >= 8
++                            && run.contains(&b'_')
++                            && run.iter().any(u8::is_ascii_uppercase)
++                            && PREFIXES.iter().any(|p| run.starts_with(p))
++                        {
++                            found = String::from_utf8_lossy(run).into_owned();
++                        }
++                        i = j.max(i + 1);
++                    } else {
++                        i += 1;
++                    }
++                }
++                // Drop a trailing `_xxxxxxxx` hash part.
++                let cut = found.rfind('_').filter(|&k| found.len() - k - 1 == 8 && found[k + 1..].bytes().all(|b| b.is_ascii_hexdigit()));
++                parts.push(match cut {
++                    Some(k) => found[..k].to_owned(),
++                    None => found,
++                });
++            }
++            let n: Arc<str> = Arc::from(parts.join(" + "));
++            NAMES.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, n.clone());
++            n
++        }
++    };
++    *COUNTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(name).or_default() += 1;
++    let now = crate::host::now_ms();
++    let last = LAST.load(Relaxed);
++    if last == 0 {
++        LAST.store(now.max(1), Relaxed);
++        FRAME0.store(crate::frame::current(), Relaxed);
++        return;
++    }
++    if now >= last + 10_000 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
++        let frame = crate::frame::current();
++        let frames = frame.saturating_sub(FRAME0.swap(frame, Relaxed)).max(1);
++        let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
++        let mut v: Vec<(Arc<str>, u64)> = counts.into_iter().collect();
++        v.sort_by(|a, b| b.1.cmp(&a.1));
++        let total: u64 = v.iter().map(|x| x.1).sum();
++        let top: Vec<String> = v.iter().take(45).map(|(n, c)| format!("{n} {:.0}", *c as f64 / frames as f64)).collect();
++        tracing::info!("DRAWCOUNT per frame by shader name ({frames} frames, {:.0} in all): {}", total as f64 / frames as f64, top.join("; "));
++    }
++}
++
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn is_skipped(this: This) -> bool {
+-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
++    if this.is_null() {
++        return false;
++    }
++    count_draw(pipeline(this));
++    skipped_shader(pipeline(this)).is_some()
+ }
+ 
+ /// Counts a draw or dispatch of `this` intentionally skipped or dropped
+diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
+index a7e974b..d25d36a 100644
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -67,6 +67,25 @@ pub(super) fn folder() -> Option<PathBuf> {
+     DIR.get().cloned()
+ }
+ 
++/// Whether `victory warm` found the driver's compiler crashing on the
++/// pipeline with this key (it is named in `warm-bad.txt`). The title would
++/// end inside the compiler on the first draw that asked for it, so such a
++/// pipeline is left out and its draws are dropped. False until the cache
++/// folder is known.
++pub(super) fn known_bad(key: &str) -> bool {
++    static BAD: OnceLock<HashSet<String>> = OnceLock::new();
++    let Some(dir) = DIR.get() else { return false };
++    BAD.get_or_init(|| {
++        std::fs::read_to_string(dir.join("warm-bad.txt"))
++            .unwrap_or_default()
++            .lines()
++            .filter_map(|l| l.split(' ').next())
++            .map(str::to_owned)
++            .collect()
++    })
++    .contains(key)
++}
++
+ /// Host pipelines created, loaded from the library, and title pipelines
+ /// started at creation, since the start.
+ pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index 5c61fc5..9bc3661 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -118,7 +118,11 @@ impl Pending {
+         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+             && shaders.iter().all(|s| s.stage != "mesh"))
+             || scene_input;
+-        let left_out = left_out(&shaders);
++        let key = key.finalize().to_hex()[..32].to_owned();
++        let left_out = left_out(&shaders).or_else(|| {
++            super::library::known_bad(&key)
++                .then_some("crashes the driver's compiler (warm-bad.txt), left out")
++        });
+         Pending {
+             screen,
+             scene_input,
+@@ -128,7 +132,7 @@ impl Pending {
+             queue_state: AtomicU8::new(NOT_QUEUED),
+             was_slow: AtomicBool::new(false),
+             made: OnceLock::new(),
+-            key: key.finalize().to_hex()[..32].to_owned(),
++            key,
+             used: AtomicBool::new(false),
+         }
+     }
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 14dc160..c7d1607 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -126,6 +126,9 @@ struct Card {
+     sent: Mutex<SentRuns>,
+     /// Whether something was put into `dirty` since it was last taken.
+     touched: std::sync::atomic::AtomicBool,
++    /// Local patch: the copy itself, set when it joins [`CARDED`], so that a
++    /// copy that becomes touched queues itself in [`TOUCHED`].
++    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
+     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
+     size: u64,
+ }
+@@ -617,11 +620,15 @@ impl SentRuns {
+ /// be merged came after are dropped.
+ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+     let mut out = Vec::new();
+-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
++    // Local patch: only the copies that queued themselves when touched
++    // (`Shadow::card_changed_runs`), not every copy in the card's memory at
++    // every submission (41 a frame in the city, a weak reference raised and
++    // dropped for each copy each time). Taken before any copy's lock.
++    let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+-    carded.retain(|weak| {
++    for weak in touched {
+         let Some(shadow) = weak.upgrade() else {
+-            return false;
++            continue;
+         };
+         let ranges = shadow
+             .card
+@@ -641,11 +648,34 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
+         if !ranges.is_empty() {
+             out.push((shadow, ranges));
+         }
+-        true
+-    });
++    }
++    // Now and then: forget the copies that went (the list is also read by
++    // the frame line and diagnostics).
++    static CALLS: AtomicU64 = AtomicU64::new(0);
++    if CALLS.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
++        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.strong_count() > 0);
++    }
+     out
+ }
+ 
++/// Local patch: the copies in the card's memory that were touched since
++/// [`card_dirty`] last took them (each once, queued by its first touch).
++static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
++
++/// A copy in the card's memory joins [`CARDED`], knowing itself.
++fn carded(shadow: &Arc<Shadow>) {
++    if let Some(card) = &shadow.card {
++        let _ = card.me.set(Arc::downgrade(shadow));
++        // Touched before it knew itself (its first filling): queued now. A
++        // touch in between may have queued it too; a second look finds
++        // nothing and costs nothing.
++        if card.touched.load(Ordering::Acquire) {
++            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
++        }
++    }
++    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
++}
++
+ /// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
+ /// pages the write watch and the guards hold for unchanged since they were
+ /// taken, compared with title memory, `most` bytes a call in turn. `say` gets
+@@ -1490,7 +1520,16 @@ fn spin(there: impl Fn() -> bool) {
+ 
+ /// How many threads are kept for [`wide`].
+ fn wide_threads() -> usize {
+-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
++    // Local change: `VICTORY_WIDE_THREADS` sets it (2 to 16); the default is
++    // as before (a quarter of the processors, 2 to 6).
++    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *N.get_or_init(|| {
++        std::env::var("VICTORY_WIDE_THREADS")
++            .ok()
++            .and_then(|v| v.trim().parse::<usize>().ok())
++            .map(|n| n.clamp(2, 16))
++            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
++    })
+ }
+ 
+ fn workers() -> &'static Workers {
+@@ -4130,7 +4169,13 @@ impl Shadow {
+             }
+         }
+         // (Under the lock: what takes the list sees it or finds it set.)
+-        card.touched.store(true, Ordering::Release);
++        // Local patch: the first touch since it was last taken queues the
++        // copy for [`card_dirty`], which then looks at the touched ones only.
++        if !card.touched.swap(true, Ordering::AcqRel)
++            && let Some(me) = card.me.get()
++        {
++            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
++        }
+     }
+ 
+     /// Whether shaders were ever declared to write it.
+@@ -4427,6 +4472,7 @@ impl Shadow {
+                 dirty: Mutex::default(),
+                 sent: Mutex::default(),
+                 touched: Default::default(),
++                me: Default::default(),
+                 size: len.next_multiple_of(PIECE as u64),
+             });
+         }
+@@ -4583,6 +4629,7 @@ mod land_tests {
+             dirty: Mutex::default(),
+             sent: Mutex::default(),
+                 touched: Default::default(),
++                me: Default::default(),
+             size: len as u64,
+         });
+         Some(shadow)
+@@ -4998,6 +5045,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+                     dirty: Mutex::default(),
+                     sent: Mutex::default(),
+                 touched: Default::default(),
++                me: Default::default(),
+                     size,
+                 };
+                 (on_card, Some(card))
+@@ -5023,7 +5071,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+         shadow.card = card;
+         let shadow = Arc::new(shadow);
+         if shadow.card.is_some() {
+-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
++            carded(&shadow);
+         }
+         entry.shadow = Some(shadow);
+     }
+@@ -5226,10 +5274,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+         dirty: Mutex::default(),
+         sent: Mutex::default(),
+         touched: Default::default(),
++                me: Default::default(),
+         size: len,
+     });
+     let shadow = Arc::new(shadow);
+-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
++    carded(&shadow);
+     Some(shadow)
+ }
+ 
+@@ -5315,6 +5364,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
+                 dirty: Mutex::default(),
+                 sent: Mutex::default(),
+                 touched: Default::default(),
++                me: Default::default(),
+                 size: len,
+             };
+             (on_card, Some(card))
+@@ -5333,7 +5383,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
+     shadow.card = card;
+     let shadow = Arc::new(shadow);
+     if shadow.card.is_some() {
+-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
++        carded(&shadow);
+     }
+     note(&shadow);
+     map.insert((start, len), shadow.clone());
