@@ -506,8 +506,40 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
+    // Local patch: `VICTORY_SKIP_NAMES=MirrorReflection,CascadeShadows` skips every
+    // pipeline with a shader whose container holds one of these texts (the
+    // shader's name), the answer kept per pipeline.
+    static NAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_NAMES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.as_bytes().to_vec())
+            .collect()
+    });
+    if hashes.is_empty() && names.is_empty() {
         return None;
+    }
+    if !names.is_empty() {
+        static SEEN: std::sync::RwLock<Option<HashMap<usize, bool>>> = std::sync::RwLock::new(None);
+        let key = std::ptr::from_ref(p) as usize;
+        let known = SEEN.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).copied());
+        let hit = match known {
+            Some(hit) => hit,
+            None => {
+                let hit = p
+                    .shaders
+                    .iter()
+                    .any(|s| names.iter().any(|n| s.container.windows(n.len()).any(|w| w == n.as_slice())));
+                SEEN.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, hit);
+                hit
+            }
+        };
+        if hit {
+            return p.shaders.first().map(|shader| shader.hash.as_str());
+        }
     }
     p.shaders
         .iter()
@@ -515,9 +547,94 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// Local patch (diagnostics): `VICTORY_COUNT_DRAWS=1` logs every 10 s which
+/// shader names the draws and dispatches are made with, per frame.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_draw(p: &Pipeline) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_COUNT_DRAWS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    static NAMES: std::sync::RwLock<Option<HashMap<usize, Arc<str>>>> = std::sync::RwLock::new(None);
+    static COUNTS: Mutex<Option<HashMap<Arc<str>, u64>>> = Mutex::new(None);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static FRAME0: AtomicU64 = AtomicU64::new(0);
+    let key = std::ptr::from_ref(p) as usize;
+    let known = NAMES.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned());
+    let name = match known {
+        Some(n) => n,
+        None => {
+            // The first run of name characters in each container that looks like
+            // a shader name (a prefix, an underscore, capitals): stage letters and
+            // the hash suffix left off.
+            let mut parts: Vec<String> = Vec::new();
+            for s in &p.shaders {
+                let bytes = &s.container;
+                let mut i = 0;
+                let mut found = String::new();
+                while i < bytes.len() && found.is_empty() {
+                    if bytes[i].is_ascii_alphabetic() && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) {
+                        let mut j = i;
+                        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b':') {
+                            j += 1;
+                        }
+                        let run = &bytes[i..j];
+                        const PREFIXES: [&[u8]; 17] = [
+                            b"PS_", b"VS_", b"MS_", b"MSNC_", b"MST", b"CS", b"DS_", b"HS_", b"GS_", b"ps_", b"vs_", b"ptfx_",
+                            b"ptx_", b"TS_", b"AS_", b"SPS_", b"cs_",
+                        ];
+                        if run.len() >= 8
+                            && run.contains(&b'_')
+                            && run.iter().any(u8::is_ascii_uppercase)
+                            && PREFIXES.iter().any(|p| run.starts_with(p))
+                        {
+                            found = String::from_utf8_lossy(run).into_owned();
+                        }
+                        i = j.max(i + 1);
+                    } else {
+                        i += 1;
+                    }
+                }
+                // Drop a trailing `_xxxxxxxx` hash part.
+                let cut = found.rfind('_').filter(|&k| found.len() - k - 1 == 8 && found[k + 1..].bytes().all(|b| b.is_ascii_hexdigit()));
+                parts.push(match cut {
+                    Some(k) => found[..k].to_owned(),
+                    None => found,
+                });
+            }
+            let n: Arc<str> = Arc::from(parts.join(" + "));
+            NAMES.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, n.clone());
+            n
+        }
+    };
+    *COUNTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(name).or_default() += 1;
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if last == 0 {
+        LAST.store(now.max(1), Relaxed);
+        FRAME0.store(crate::frame::current(), Relaxed);
+        return;
+    }
+    if now >= last + 10_000 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        let frame = crate::frame::current();
+        let frames = frame.saturating_sub(FRAME0.swap(frame, Relaxed)).max(1);
+        let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut v: Vec<(Arc<str>, u64)> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = v.iter().map(|x| x.1).sum();
+        let top: Vec<String> = v.iter().take(45).map(|(n, c)| format!("{n} {:.0}", *c as f64 / frames as f64)).collect();
+        tracing::info!("DRAWCOUNT per frame by shader name ({frames} frames, {:.0} in all): {}", total as f64 / frames as f64, top.join("; "));
+    }
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    if this.is_null() {
+        return false;
+    }
+    count_draw(pipeline(this));
+    skipped_shader(pipeline(this)).is_some()
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped

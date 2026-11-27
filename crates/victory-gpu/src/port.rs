@@ -105,7 +105,18 @@ static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= low() && len > 0)
+    on() && at.checked_add(len).is_some_and(|end| end <= low() && len > 0) && !(skip_low() && at < LOW)
+}
+
+/// Local experiment (2026-11-27): `VICTORY_PORT_LOW=0` leaves the title's
+/// 32-bit graphics memory out (a copy, as without port 1) while
+/// `VICTORY_PORT_ALL=1` keeps everything above 4 GiB in place. A crash in a
+/// 10-minute drive was the title following a garbage pointer in a list node
+/// of its own allocator, 3 KB into that heap (in place through port 1): the
+/// title keeps CPU bookkeeping in the heap the card writes.
+fn skip_low() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var("VICTORY_PORT_LOW").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// Local experiment (2026-11-27): `VICTORY_PORT_ALL=1` ports view memory at
