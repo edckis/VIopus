@@ -89,6 +89,9 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+#[allow(dead_code)] // milestone 1 of the core rebuild: its users come with milestone 2
+mod direct;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;

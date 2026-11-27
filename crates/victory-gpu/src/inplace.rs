@@ -335,6 +335,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // had it before (it stays mapped: someone may be writing through it).
     v.whole.retain(|w| w.0 != section);
     v.sections.push((section, bytes, committed));
+    drop(v);
+    crate::direct::section(section, bytes, committed);
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
@@ -370,6 +372,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    crate::direct::mapped(at, len, section, offset);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -387,6 +390,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
+        crate::direct::unmapped(base, bytes);
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
@@ -1320,6 +1324,7 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
+    crate::direct::say();
     if probe_level() == 0 {
         return;
     }

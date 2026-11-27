@@ -1,8 +1,8 @@
-﻿# Build comparison on the test saves (GK_TESTDATA=1 always): launch, wait for the world, settle 45 s,
-# then 90 s standing: game fps/ms/prep/draws from the log, the game's private bytes and free RAM.
-# Optional -Move: a further 90 s running around (W+A/D+F). Closes the game at the end.
+# Build comparison on the test saves (GK_TESTDATA=1 always): launch, wait for the world, settle -Settle (20) s,
+# then -Seconds (45) standing: game fps/ms/prep/draws from the log, the game's private bytes and free RAM.
+# Optional -Move: a further -Seconds running around (W+A/D+F). Closes the game at the end.
 # Usage: bench7.ps1 -Tag name -Env "VICTORY_PORT_ALL=0;VICTORY_INPLACE=0" [-Move]
-param([string]$Tag = 'x', [string]$Env = '', [int]$Threshold = 3500, [switch]$Move)
+param([string]$Tag = 'x', [string]$Env = '', [int]$Threshold = 3500, [switch]$Move, [int]$Settle = 20, [int]$Seconds = 45)
 $scr = $PSScriptRoot
 $log = "$scr\gk.err"; $out = "$scr\bench7-$Tag.txt"
 Remove-Item $out -ErrorAction SilentlyContinue
@@ -19,10 +19,10 @@ while ((Get-Date) -lt $deadline -and -not $game.HasExited) {
 }
 if ($game.HasExited) { Say "$Tag game exited before the world (crash?)"; exit 1 }
 if ($hits -lt 2) { Say "$Tag never reached the world"; & "$scr\gk.ps1" stop | Out-Null; exit 1 }
-Start-Sleep 45
+Start-Sleep $Settle
 function Phase($name, [scriptblock]$during) {
   $start = [datetime]::UtcNow; $mem = @()
-  $end = (Get-Date).AddSeconds(90); $k = 0
+  $end = (Get-Date).AddSeconds($Seconds); $k = 0
   while ((Get-Date) -lt $end -and -not $game.HasExited) {
     if ($during) { & $during $k } else { Start-Sleep 5 }
     $k++
