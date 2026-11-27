@@ -89,3 +89,4 @@ Thumbs.db
 /tools/cur/
 /tools/testdata/
 /tools/testdata-template/
+/tools/prof-*.txt
