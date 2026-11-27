@@ -2,6 +2,47 @@
 
 All of this was measured on the PC in the [README](../README.md): Ryzen 7 9800X3D, RX 9070 XT, 32 GB, Series S profile. It is ordered by topic, newest first within each.
 
+## The game's time against ours (core-rebuild step 1, 2026-11-27 evening)
+
+**How it was measured:**
+- **Traces:** `VICTORY_TIMELINE=150+190+260+290,10,<file>` on `tools\bench7.ps1`, four traces of 10 frames, two standing and two on foot. The same was run once with in-place memory off (`VICTORY_PORT_ALL=0;VICTORY_INPLACE=0`).
+- **CPU split:** `tools\threadtimes.py` (new) gives the kernel and user time of every thread over 20 s standing.
+- **The card:** one run with `VICTORY_GPU_TIMING=1`, which runs each list on its own; frame rate in that mode is meaningless.
+
+**The critical chain**, the chain of work and waits each present came out of, per frame:
+
+| | Standing (47–49 ms frames) | On foot (33–38 ms frames) |
+|---|---|---|
+| The game's own code (its threads, outside our calls) | 13–17 ms, 8–12 of it the main thread | 14–18 ms, ~12 the main thread |
+| The card | 6–7 ms | 1–2 ms |
+| Woken threads waiting for a core | 3.4–4.9 ms | 3.8–4.2 ms |
+| The game polling with `Sleep` | 1.9–3.3 ms | 2.7–3.2 ms |
+| Our layer: refreshes of copies, `VirtualProtect`, `GetWriteWatch`, jobs, submit steps, landing | ~15–20 ms | ~8–12 ms |
+
+**The game's main thread:**
+- It runs 20–24 ms a frame.
+- About 82% of that is user time and 18% kernel time (95 of 518 ms per second). The kernel part is page faults and system calls, which is our layer's.
+- Only about 60% of its running time lies on the critical chain. The game overlaps the rest with our work.
+
+**CPU load, standing:**
+- The game's 49 threads use 4.3 cores together (10% kernel).
+- **Our 8 list-translation threads use 4.1 cores**, each about half a core.
+- The whole process uses about 11 of the 16 logical processors, which is 8 physical cores. The game's threads therefore share physical cores with ours through SMT.
+
+**The card:**
+- It is busy (submission start to end, timestamps) 27–28 ms a frame standing and 18–22 ms on foot.
+- It is the same with the copies (28.4 ms), so reading memory in place over PCIe doesn't slow it.
+- Its time is mostly in parallel, so it lies only 1–8 ms on the chain. That is why skipping a third of the draws (the shadow maps) changed nothing.
+- In the timing run (lists one at a time), about 85% of the card's time is the title's translated lists. Our own lists are the other ~15%: preludes refreshing copies (8 ms) and compares (2.6 ms) of 72 ms.
+- The "card ~9.5 ms" figure used earlier is outdated. A Series S renders this scene within 33 ms on a GPU several times slower, so ~24 ms of title work here suggests the translated GPU work is 2–3× slower than it should be. That is not proven yet; per-command times need `VICTORY_GPU_TIMING=1` with `VICTORY_D3D12_DRED=1`.
+
+**What it means:**
+- **30 fps:** our ~15–20 ms on the chain and the wake-up delays come out with the core rebuild, which leaves the game's 13–18 ms plus the card. 30 looks reachable without changing the game. The card at 28 ms standing is close to the 33 ms limit, though.
+- **60 fps (16.7 ms), three walls:**
+  - **The game's main thread:** ~17–20 ms of its own code at today's load. Freeing the four cores our list translation takes may shorten it; how much is unknown.
+  - **The card:** 28 ms standing, so it needs to be about 2× faster.
+  - **Our layer:** it must be completely off the chain.
+
 ## Where a frame goes (2026-11-27)
 
 **Before VIopus (cool_fox, city street, about 12,000 draws, 18 fps):**
