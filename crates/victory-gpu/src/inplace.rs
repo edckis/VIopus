@@ -156,6 +156,24 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            // VIopus diagnostics: why a big one is turned down (the first 24).
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if !window && len >= 1 << 20 && SAID.fetch_add(1, Ordering::Relaxed) < 24 {
+                // SAFETY: plain data filled in by the query.
+                let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                unsafe { mem::VirtualQuery(start as *const c_void, &mut info, size_of_val(&info)) };
+                tracing::info!(
+                    start = format_args!("{start:#x}"),
+                    len,
+                    window,
+                    state = format_args!("{:#x}", info.State),
+                    kind = format_args!("{:#x}", info.Type),
+                    protect = format_args!("{:#x}", info.Protect),
+                    region_end = format_args!("{:#x}", info.BaseAddress as usize + info.RegionSize),
+                    "VIOPUS big title memory not in place"
+                );
+            }
             None
         }
         Err(Some(e)) => {
@@ -528,6 +546,42 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
         reached += bytes;
     }
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
+}
+
+/// VIopus diagnostics: of `[at, at + len)`, the title's views that show it,
+/// the runs among them (views that follow one another in memory and in one
+/// section alike), the sections they come from, the bytes no view shows, and
+/// whether each run's section offset goes up (`ascending`) from the run before.
+pub(crate) fn runs(at: usize, len: usize) -> (usize, usize, usize, usize, usize) {
+    let v = views();
+    let end = at + len.max(1);
+    let (mut n, mut runs, mut sections, mut holes, mut ascending) = (0, 0, std::collections::BTreeSet::new(), 0usize, 0);
+    let mut last: Option<(usize, usize, u64)> = None;
+    let mut reached = at;
+    let start = v.views.range(..=at).next_back().filter(|(b, view)| *b + view.0 > at).map_or(at, |(b, _)| *b);
+    for (&a, &(bytes, s, o)) in v.views.range(start..end) {
+        if a > reached {
+            holes += a - reached;
+        }
+        n += 1;
+        sections.insert(s);
+        match last {
+            Some((la, ls, lo)) if ls == s && (a as i128 - la as i128) == (o as i128 - lo as i128) => {}
+            Some((_, ls, lo)) => {
+                runs += 1;
+                if ls == s && o > lo {
+                    ascending += 1;
+                }
+            }
+            None => runs += 1,
+        }
+        last = Some((a, s, o));
+        reached = reached.max(a + bytes);
+    }
+    if reached < end {
+        holes += end - reached;
+    }
+    (n, runs, sections.len(), holes, ascending)
 }
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.

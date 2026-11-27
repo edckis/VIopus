@@ -396,6 +396,9 @@ struct Section {
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
+    /// VIopus ([`arrange_any`]): which page number has each slice, built on
+    /// first use and kept up to date by the arranging (empty: not built).
+    owners: Mutex<Vec<usize>>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
 }
@@ -688,6 +691,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
+        owners: Mutex::new(Vec::new()),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
@@ -1172,6 +1176,7 @@ fn arrange(base: usize, pages: &[usize]) {
         moved += 1;
     }
     if moved > 0 {
+        section.owners.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let all = ARRANGED[0].fetch_add(moved, Ordering::Relaxed) + moved;
         tracing::info!(
             at = format_args!("{base:#x}"),
@@ -1184,8 +1189,105 @@ fn arrange(base: usize, pages: &[usize]) {
     }
 }
 
-/// Maps `n` pages at `address`, in place of what is mapped there; null
-/// `pages` unmaps. Returns `address`, or null if a page or the host fails.
+/// VIopus: `VICTORY_ARRANGE_ALL=1` (with renderer port 1) arranges every
+/// mapping call ([`arrange_any`]), not only the 32-bit
+/// graphics heap.
+fn arrange_all() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_ARRANGE_ALL").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// [`arrange`] for any mapping call: `pages` mapped at `base` are given the
+/// slices of their section that follow the first page's, so that the range
+/// is one stretch of the section and the GPU side can use it in place.
+/// Only fresh slices are exchanged (never mapped, never written), as in
+/// [`arrange`]: which slice a fresh number names is not observable. The
+/// title's big buffers came in 2 to 7 runs of one section before.
+fn arrange_any(base: usize, pages: &[usize]) {
+    const FEW: usize = 1;
+    if pages.len() < FEW {
+        return;
+    }
+    // The title maps a big buffer in several calls, each one run already:
+    // the pages follow on from the page mapped just below `base`, if that is
+    // one of the same section (the run it is in goes on), else from the
+    // first page's own slice.
+    let below = base.checked_sub(PAGE).and_then(|at| physical().slice_at(at));
+    // Under the read lock first: one section, and not one run already.
+    let (section, first) = {
+        let table = page_table();
+        let Some(s0) = pages.first().and_then(|p| table.pages.get(p)) else {
+            return;
+        };
+        let section = s0.section.clone();
+        let first = match &below {
+            Some(b) if Arc::ptr_eq(&b.section, &section) => b.index + 1,
+            _ => s0.index,
+        };
+        let mut run = true;
+        for (i, p) in pages.iter().enumerate() {
+            match table.pages.get(p) {
+                Some(s) if Arc::ptr_eq(&s.section, &section) => run &= s.index == first + i,
+                _ => return,
+            }
+        }
+        if run {
+            return;
+        }
+        (section, first)
+    };
+    if first + pages.len() > section.pages {
+        return;
+    }
+    let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
+    let mut table = page_table_mut();
+    let mut owners = section.owners.lock().unwrap_or_else(|e| e.into_inner());
+    if owners.len() != section.pages {
+        owners.clear();
+        owners.resize(section.pages, 0);
+        for (&number, s) in table.pages.iter() {
+            if Arc::ptr_eq(&s.section, &section) && s.index < section.pages {
+                owners[s.index] = number;
+            }
+        }
+    }
+    let (mut moved, mut stuck) = (0u64, 0u64);
+    for (i, number) in pages.iter().enumerate() {
+        let want = first + i;
+        let Some(have) = table.pages.get(number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        if !fresh(have) || !fresh(want) {
+            stuck += 1;
+            continue;
+        }
+        let other = owners[want];
+        if let Some(slice) = table.pages.get_mut(&other) {
+            slice.index = have;
+        }
+        owners[have] = other;
+        if let Some(slice) = table.pages.get_mut(number) {
+            slice.index = want;
+        }
+        owners[want] = *number;
+        moved += 1;
+    }
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if (moved > 0 || stuck > 0) && SAID.fetch_add(1, Ordering::Relaxed) < 64 {
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            pages = pages.len(),
+            moved,
+            stuck,
+            "VIOPUS arranged: a mapping call's pages given consecutive slices of their section"
+        );
+    }
+}
+
+/// Maps `n` pages at `address`, in place of what is mapped there; null/// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
     address: *mut c_void,
     n: usize,
@@ -1200,6 +1302,9 @@ pub extern "system" fn XMemMapPhysicalPages(
         && let Some(pages) = &pages
     {
         arrange(base, pages);
+        if arrange_all() {
+            arrange_any(base, pages);
+        }
     }
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");

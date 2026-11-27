@@ -155,6 +155,12 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             if n <= 8 || n.is_power_of_two() {
                 tracing::warn!(start = format_args!("{start:#x}"), len, window, why, "renderer port 1: title memory not in place, a copy as before");
             }
+            // VIopus diagnostics: how scattered the big title buffers are.
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if !window && len >= 4 << 20 && SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                let (views, runs, sections, holes, ascending) = crate::inplace::runs(start as usize, len as usize);
+                tracing::info!(start = format_args!("{start:#x}"), len, views, runs, sections, holes, ascending, "VIOPUS pool buffer not in place");
+            }
             None
         }
     }

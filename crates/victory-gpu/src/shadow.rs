@@ -166,6 +166,14 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// VIopus experiment: `VICTORY_INPLACE_BIG=1` lets the big title buffers
+/// [`cards`] would copy into the card's memory be used in place instead
+/// (with `VICTORY_INPLACE=2`).
+fn inplace_big() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_BIG").is_some_and(|v| v == "1"))
+}
+
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
@@ -5256,7 +5264,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
+        // VIopus: `VICTORY_INPLACE_BIG=1` offers the big ones in place too: no
+        // copy in the card's memory, so no write tracking and no uploads for
+        // them, at the price of the card reading them over the bus.
+        let big = cards() && (size >= card_limits().0 || card_all()) && !inplace_big();
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
