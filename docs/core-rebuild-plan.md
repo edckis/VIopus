@@ -57,3 +57,23 @@ Each milestone is behind a switch and gets a clean alternating A/B (`tools\bench
 - **Writes by the card into memory the CPU reads:** this already happens with port 1. The title keeps allocator lists in its 32-bit graphics heap, which crashed once when that heap was in place (`VICTORY_PORT_LOW`). That heap stays a copy until the cause is known.
 - **PCIe reads:** data the card reads many times a frame (big static meshes) is slower from the PC's memory than from the card's own. Milestone 3 must keep a card copy for buffers the CPU never writes.
 - **Scale:** milestones 2 and 3 change the translator and the host's descriptor handling, the two biggest parts of the layer. That is weeks, not days, and the first CPU gain is at milestone 3.
+
+## Result of milestones 1 and 2 (2026-11-27 night): stopped
+
+- **Milestone 1** works. The pool's four sections open as host heaps, and the directory follows the title's mappings (10.7 GB of addresses).
+- **Milestone 2** works, but rendering is not fully right (the road is darker in places) and it adds GPU work. Whole-dword buffer loads through shader resource views read the pool in place page by page.
+  - The host's view stays the fallback where a page is not in the pool or the card writes it.
+  - Hidden write paths had to be found one by one: copy-back landings, copies, render targets.
+- **Why it stops here (measured, 10 s standing, `VICTORY_DIRECT=1`):**
+
+  | Refresh requests of host copies | Requests | Share |
+  |---|---|---|
+  | All | 32 M | 100% |
+  | Of copies the card writes | 19.1 M | 60% (98% of the bytes) |
+  | Of memory outside the pool (private memory, above the directory, not mapped) | 8.6 M | 27% |
+  | Of memory that could be read in place | 2.3 M | **7%** |
+  | Crossing out of the pool, or pages flagged written | 2.0 M | 6% |
+
+  Milestone 3 could leave out at most the 7%. The work is in buffers the card writes, which need every reader and writer in place at once. The rest is private memory, which `VICTORY_INPLACE` handles in another way.
+- **AMD driver leak:** each run with the pool opened as host heaps (`OpenExistingHeapFromFileMapping` on the committed sections) leaves about 4.3 GB of commit charge behind after the game exits, until a reboot. After seven runs the PC had 42 GB committed with nothing running (11.7 GB after a reboot). An earlier run went past the commit limit, and the title and another program died with it. **Do not run `VICTORY_DIRECT=1` without a reboot plan.** `tools\memguard.ps1` now guards every automated run.
+- The code stays on `core-rebuild`, off by default (`VICTORY_POOL_COMMIT`, `VICTORY_DIRECT`).

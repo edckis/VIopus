@@ -411,6 +411,67 @@ pub(crate) fn card_writes(at: u64, len: u64) {
     }
 }
 
+/// Whether every page of `[at, at + len)` could be read in place: shown by
+/// an open section of the pool and never written by the card through a host
+/// copy. Without a lock.
+pub(crate) fn eligible(at: u64, len: u64) -> bool {
+    let entries = ENTRIES.load(Ordering::Acquire);
+    if entries.is_null() || len == 0 {
+        return false;
+    }
+    let mut page = at / PAGE;
+    while page * PAGE < at + len {
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return false;
+        }
+        // SAFETY: an entry of the directory, which lives for good.
+        let n = unsafe { entries.add(page as usize * 2).read_volatile() };
+        if n == 0 || n & WRITTEN_FLAG != 0 || !OPEN.get((n - 1) as usize).is_some_and(|o| o.load(Ordering::Acquire)) {
+            return false;
+        }
+        page += 1;
+    }
+    true
+}
+
+/// Since the last line: refreshes host copies were asked for, and their
+/// bytes; of them, those of memory that could be read in place ([`eligible`]):
+/// what milestone 3 could leave out, at most.
+static REFRESHES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The rest by kind, requests and MB-weighted bytes: copies the card writes;
+/// memory the directory does not have at all (private memory, above it, not
+/// mapped); pool pages flagged as written by the card; pool pages of a copy
+/// not declared written but crossing a page that is not in the pool.
+static KINDS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// A refresh of `[at, at + len)` was asked for.
+pub(crate) fn refresh_asked(at: u64, len: u64, card_writes_it: bool) {
+    REFRESHES[0].fetch_add(1, Ordering::Relaxed);
+    REFRESHES[1].fetch_add(len, Ordering::Relaxed);
+    if !card_writes_it && eligible(at, len) {
+        REFRESHES[2].fetch_add(1, Ordering::Relaxed);
+        REFRESHES[3].fetch_add(len, Ordering::Relaxed);
+        return;
+    }
+    let kind = if card_writes_it {
+        0
+    } else {
+        let entries = ENTRIES.load(Ordering::Acquire);
+        let page = at / PAGE;
+        // SAFETY: an entry of the directory, which lives for good.
+        let n = if entries.is_null() || page >= u64::from(MEMORY_PAGES) - 1 { 0 } else { unsafe { entries.add(page as usize * 2).read_volatile() } };
+        if n == 0 {
+            1
+        } else if n & WRITTEN_FLAG != 0 {
+            2
+        } else {
+            3
+        }
+    };
+    KINDS[2 * kind].fetch_add(1, Ordering::Relaxed);
+    KINDS[2 * kind + 1].fetch_add(len, Ordering::Relaxed);
+}
+
 /// The line every ten seconds or so.
 pub(crate) fn say() {
     if !on() {
@@ -436,6 +497,26 @@ pub(crate) fn say() {
         |_| {},
     );
     let (pages, open_bytes) = shown.unwrap_or((0, 0));
+    let r: Vec<u64> = REFRESHES.iter().map(|x| x.swap(0, Ordering::Relaxed)).collect();
+    tracing::info!(
+        "VIopus direct: since the last line, refreshes of host copies asked for: {} ({} MB); of them of memory that could be read in place: {} ({} MB)",
+        r[0],
+        r[1] >> 20,
+        r[2],
+        r[3] >> 20
+    );
+    let k: Vec<u64> = KINDS.iter().map(|x| x.swap(0, Ordering::Relaxed)).collect();
+    tracing::info!(
+        "VIopus direct: the rest: copies the card writes {} ({} MB), memory not in the pool {} ({} MB), pool pages flagged written {} ({} MB), crossing out of the pool {} ({} MB)",
+        k[0],
+        k[1] >> 20,
+        k[2],
+        k[3] >> 20,
+        k[4],
+        k[5] >> 20,
+        k[6],
+        k[7] >> 20
+    );
     tracing::info!(
         "VIopus direct: {} pages of title addresses ({} MB) show the pool in place; sections open {} ({} MB), refused {}; since the start pages filled {}, cleared {}, above the directory {}, views of sections not known {}; pool pages the card writes through host copies {} ({} MB)",
         pages,

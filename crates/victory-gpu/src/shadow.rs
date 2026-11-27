@@ -3185,6 +3185,9 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        if crate::direct::on() {
+            crate::direct::refresh_asked(address, len, self.written());
+        }
         list.defer_refresh(self, address as usize, len as usize);
     }
 
