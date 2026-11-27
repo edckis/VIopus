@@ -66,7 +66,7 @@ The numbers mean the following:
    - **The exception, the 32-bit graphics heap** (`VICTORY_PORT_LOW=0`, the default):
      - **The crash:** with this heap in place, a fast drive crashed after 10.5 minutes. The title was walking a linked list of its own allocator whose node, 3 KB into this heap, held garbage. The title keeps its CPU bookkeeping inside the memory the card writes.
      - **The fix:** the heap is kept as a copy, as before port 1.
-     - **The cost:** about 1–2 fps while driving; nothing measurable in the standing benchmarks.
+     - **The cost:** small. In an alternating 2×2 benchmark it was 22.9 and 21.9 fps standing, against 23.1 and 23.0 with the heap in place (about 3%). One hand-played drive each came out at 19.9 vs 21.7 fps.
      - **The result:** a 15-minute drive at top speed did not crash.
      - `VICTORY_PORT_LOW=1` puts the heap back in place.
 3. **No 300–800 ms freezes while new pipelines compile**: `VICTORY_PIPELINE_WAIT_MS=10`, set in `tools\settings.cmd`.
@@ -85,6 +85,8 @@ The numbers mean the following:
 - **System settings:** Windows power plan, process and helper-thread priorities, CPU affinity layouts, spinning thread pools.
 - **Thread counts and build:** `VICTORY_THIN_THREADS` of 4, 6 or 12; `VICTORY_WIDE_THREADS=8`; thin LTO with `codegen-units=1`.
 - **Other switches:** `VICTORY_HEAP_SYNC_EARLY`, `VICTORY_JOIN_PARTS=32`, `VICTORY_SUBMIT_FRAMES=2` (tested twice, 2×2 runs).
+- **More memory in place:** `VICTORY_INPLACE_BIG=1` puts the big private buffers in place, but showed no clear gain (2×2 runs). `VICTORY_ARRANGE_ALL=1` tries to make the title's scattered pool buffers one stretch, the way upstream's `arrange` does for the 32-bit heap. The title maps those buffers one page per call into pages that DirectStorage has already filled, so no page could be moved without copying its data. Both switches are kept, off.
+- **Making the "nothing changed" checks cheaper:** a profile of the submit thread shows the checks are a small part of its time. Its CPU goes to copying bytes (about 27%), asking Windows about written pages (`GetWriteWatch`, about 15%) and refreshing textures (about 16%), and it waits more than half the time.
 - **Skipping the sun's shadow maps:** `VICTORY_SKIP_NAMES=CascadeShadows`. That removes about 22% of all draw calls, but fps didn't change (2×2 runs). So translating the title's draw calls is not what limits the frame. The limit is the submit thread's bookkeeping for memory that is still copied: about 10 ms a frame of checks, 96% of which find nothing new.
 - **Smaller memory windows:** `VICTORY_WINDOW_KB` 256 or 64 put up to 3.5 GB in place, but fps didn't change and the layer kept rebuilding regions.
 - **Moving the game data from D: to C:**, both NVMe drives.
