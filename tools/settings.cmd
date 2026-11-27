@@ -36,6 +36,10 @@ if not defined VICTORY_INPLACE set "VICTORY_INPLACE=2"
 rem A frame waits at most 10 ms for a pipeline still compiling (the default 500 made 300-800 ms spikes)
 if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=10"
 
+rem The title's 30 fps cap lifted to 60 (upstream switch: the title's own frame-rate setting is patched
+rem at load, so its clock and simulation step stay right). 33.333 puts the console's 30 back.
+if not defined VICTORY_FRAME_INTERVAL_MS set "VICTORY_FRAME_INTERVAL_MS=16.667"
+
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-viopus"
 if not defined VICTORY_CONSOLE set "VICTORY_CONSOLE=series-s"
 if not defined VICTORY_LOG set "VICTORY_LOG=info"

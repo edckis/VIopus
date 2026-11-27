@@ -36,7 +36,12 @@ function Front($g) {
 switch ($Action) {
   'launch' {
     if (Get-Process victory -ErrorAction SilentlyContinue) { 'already running'; exit 1 }
-    if (-not $env:VICTORY_GAME_DIR) { 'set VICTORY_GAME_DIR to the folder of your own copy of the game first'; exit 1 }
+    # the game folder: the environment, else local.cmd next to the README (set "VICTORY_GAME_DIR=...")
+    if (-not $env:VICTORY_GAME_DIR -and (Test-Path "$scr\..\local.cmd")) {
+      $line = Get-Content "$scr\..\local.cmd" | Where-Object { $_ -match 'VICTORY_GAME_DIR=([^"]+)' } | Select-Object -First 1
+      if ($line -match 'VICTORY_GAME_DIR=([^"]+)') { $env:VICTORY_GAME_DIR = $matches[1].Trim() }
+    }
+    if (-not $env:VICTORY_GAME_DIR) { 'set VICTORY_GAME_DIR (or create local.cmd, see README) to the folder of your own copy of the game first'; exit 1 }
     $env:VICTORY_LOG = 'info'
     $env:VICTORY_KEYS = '9:Enter'
     # several settings: separate with ';' (a comma stays inside a value, as in VICTORY_SKIP_NAMES)
@@ -46,7 +51,7 @@ switch ($Action) {
     # testdata-template, a copy of a save of your own, see README) instead of the user's own:
     # every test starts at the same place and hour, and the user's saves stay as they are.
     if ($env:GK_TESTDATA -eq '1') {
-      $tpl = "$scr\testdata-template"; $work = "$scr\testdata"
+      $tpl = "$env:LOCALAPPDATA\VIctory\viopus-test\template"; $work = "$env:LOCALAPPDATA\VIctory\viopus-test\work"
       if (Test-Path $work) { Remove-Item $work -Recurse -Force }
       Copy-Item $tpl $work -Recurse
       Get-ChildItem $work -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
@@ -135,5 +140,7 @@ switch ($Action) {
   }
   default { 'usage: gk.ps1 launch|shot|key|status|stop' }
 }
+
+
 
 

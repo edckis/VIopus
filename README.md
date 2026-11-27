@@ -1,6 +1,9 @@
 # VIopus
 
-A personal fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs an Xbox Series title on Windows from files you supply. VIopus is tuned for an **AMD Ryzen + Radeon RX 9070 XT** PC. The goal is a stable 30 fps in the open world, the title's own cap, from real rendered frames only (no frame generation).
+A personal fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs an Xbox Series title on Windows from files you supply. VIopus is tuned for an **AMD Ryzen + Radeon RX 9070 XT** PC. The goal is a stable 30 fps or more in the open world, from real rendered frames only (no frame generation).
+
+> [!NOTE]
+> **Performance first, graphics later.** For now VIopus does not care how the game looks, only how fast it runs. Settings and changes are chosen for frame rate even when the picture suffers. Examples: the Series S profile at its 1280×720 render size, ray tracing off, and the cheap ambient-light stand-in. Visual quality comes after the frame rate is where it should be.
 
 > [!IMPORTANT]
 > **Measured on one PC only.** Every number here comes from this machine:
@@ -63,7 +66,8 @@ The numbers mean the following:
    - **The problem:** AMD's RDNA4 compiler crashes at `amdxc64.dll+0x861b9f` on some pipelines. Before any fix, this killed every run within 7–15 minutes.
    - **cool_fox / Vice-Tay:** a skip list, `warm-bad.txt`, held in `pipeline/library.rs` (`known_bad`), held up for 98 minutes with no crash.
    - **VIopus:** Belobug's compiler-crash guard catches these crashes at run time, so the skip list isn't needed here.
-6. **Faster locks in the descriptor heap host** (cool_fox only, about 5–7%). This patch is kept for reference in [`docs/patches/cool_fox-local-changes.patch`](docs/patches/cool_fox-local-changes.patch) and is not yet ported to VIopus.
+6. **The 30 fps cap lifted to 60.** This is upstream's `VICTORY_FRAME_INTERVAL_MS` switch, now on by default in `tools\settings.cmd`. The loader patches the three places where the title reads its own frame-rate setting (`rate=60` in the log), so its clock and simulation step stay right, and the frame clock ticks at 16.667 ms. The heavy city scenes are below 30 fps anyway, so they are unchanged; light scenes are no longer stopped at exactly 30.0. Set `VICTORY_FRAME_INTERVAL_MS=33.333` to bring back the console's 30.
+7. **Faster locks in the descriptor heap host** (cool_fox only, about 5–7%). This patch is kept for reference in [`docs/patches/cool_fox-local-changes.patch`](docs/patches/cool_fox-local-changes.patch) and is not yet ported to VIopus.
 
 ### Tried and measured, no gain on this PC
 
@@ -80,7 +84,7 @@ The numbers mean the following:
 - **A crash after 10.5 minutes of fast driving** with in-place memory on. The title's code read a garbage pointer (`0xffffffffffffffff`) while walking data at the start of the in-place graphics heap. There are two suspects, not yet separated: in-place memory itself, or a compute pipeline that the compiler-crash guard had left out three minutes earlier. To compare, run with `set VICTORY_PORT_ALL=0` and `set VICTORY_INPLACE=0`.
 - **Ragged dark speckle** along the left and right window edges.
 - **32 GB of RAM is tight:** the game uses 23–28 GB of private memory. Close browsers before playing.
-- **The title caps at 30 fps.** Upstream's `VICTORY_FRAME_INTERVAL_MS=16.667` lifts the cap, but that has not been tested here.
+- **The 60 fps cap is new here.** Whether anything in the game misbehaves above 30 fps (physics, animation, scripts) has not been checked in long play yet.
 
 ## How to run
 
@@ -112,7 +116,7 @@ All forks of VIctory share one save folder, `%LOCALAPPDATA%\victory\data`. Back 
 |---|---|
 | `settings.cmd` | The default settings, shared by both launchers |
 | `play-test.cmd` | Launcher for automated runs |
-| `gk.ps1` | Game helper. `launch [NAME=VALUE;...]` presses Enter by itself. `GK_TESTDATA=1` uses a fresh copy of `tools\testdata-template` instead of your saves; make the template from a save of your own. Also `shot`, `key`, `keys`, `status` and `stop`. Keys and screenshots only go to the game window while it is in front. |
+| `gk.ps1` | Game helper. `launch [NAME=VALUE;...]` presses Enter by itself. `GK_TESTDATA=1` uses a fresh copy of `%LOCALAPPDATA%\VIctory\viopus-test\template` instead of your saves; make the template by copying a snapshot of a save of your own there. It has to be outside the repository, because the runtime refuses to put game data in the source tree. Also `shot`, `key`, `keys`, `status` and `stop`. Keys and screenshots only go to the game window while it is in front. |
 | `bench7.ps1` | A/B benchmark on the test save: standing, then running; fps, frame time, draws, private memory, free RAM |
 | `longrun.ps1` | A long run on foot with memory and fps every minute, to catch leaks |
 | `recorder.ps1` | Records fps, memory and screenshots while you play. It never takes focus and never sends keys. |
