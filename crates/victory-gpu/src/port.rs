@@ -105,7 +105,16 @@ static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    on() && at.checked_add(len).is_some_and(|end| end <= low() && len > 0)
+}
+
+/// Local experiment (2026-11-27): `VICTORY_PORT_ALL=1` ports view memory at
+/// any console address (below 1 TiB), not only the 32-bit graphics memory:
+/// every title buffer and window that is one committed stretch of a section
+/// is read and written by the card in place.
+fn low() -> u64 {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var("VICTORY_PORT_ALL").is_ok_and(|v| v.trim() == "1")) { 1 << 40 } else { LOW }
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -176,8 +185,8 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
-        bytes = LOW.saturating_sub(first);
+    if first < low() && first + bytes > low() {
+        bytes = low().saturating_sub(first);
     }
     if bytes > MOST {
         // Only what was asked for.
