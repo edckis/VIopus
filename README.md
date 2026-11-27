@@ -36,6 +36,18 @@ These runs use the Series S profile and the same test save: a city street at noo
 | Belobug rx9070xt + renderer ports 1, 2, 5, 6, 7 | 19.7–21.2 fps | 18.2–22.5 fps | 38.0–48.6 | 0.5–1.3 GB |
 | **VIopus** (ports + in-place memory) | **22.6–23.4 fps** | **24.4–29.2 fps** | **24–33** | **3.0 GB** |
 
+**Clean re-test, 2026-11-27 afternoon.** Earlier the same day, `tools\gk.ps1` let each run's settings leak into the next runs of a batch, which made some A/B results wrong (corrected below). These runs start from clean settings and alternate a default VIopus run with each variant. A check of each run's log confirmed that only the intended switch was active.
+
+| Run | Standing | On foot | Prep (ms/frame) | Draws standing |
+|---|---|---|---|---|
+| VIopus default, 7 runs | 19.5–21.1 fps (median 20.3) | 21.5–27.2 fps (median 22.3) | 33–36 | 11,500–12,300 |
+| [Vice-Tay](https://github.com/TaynanGT/Vice-Tay) 231b6a9 (2026-11-27, with its new speedups), 2 runs | 17.4–18.0 fps | 18.1–18.2 fps | 46–48 | ~12,000 |
+| VIopus + `VICTORY_SKIP_NAMES=CascadeShadows`, 2 runs | 20.5–21.1 fps | 22.4–23.9 fps | 34–35 | 7,900–8,100 |
+| VIopus + `VICTORY_INPLACE_BIG=1`, 2 runs | 20.3–20.5 fps | 21.9–23.7 fps | 27–30 | ~11,700 |
+
+- **VIopus is about 14% faster standing and 28% faster on foot than the updated Vice-Tay** (against the default runs next to them).
+- The VIopus numbers are lower than in the table above. That table was measured on another day; the same build drifts 2–4 fps between days.
+
 Other measurements on this PC:
 
 - **VIopus while driving fast, as it ships now** (graphics heap kept as a copy, 60 fps cap): 15.5 minutes at top speed in the fastest car, played by hand. **No crash.** It averaged 19.9 fps, with a median of 19.5, the slowest 10% of samples below 15.9, and a peak of 34.4. About 7,200 draws a frame.
@@ -66,7 +78,7 @@ The numbers mean the following:
    - **The exception, the 32-bit graphics heap** (`VICTORY_PORT_LOW=0`, the default):
      - **The crash:** with this heap in place, a fast drive crashed after 10.5 minutes. The title was walking a linked list of its own allocator whose node, 3 KB into this heap, held garbage. The title keeps its CPU bookkeeping inside the memory the card writes.
      - **The fix:** the heap is kept as a copy, as before port 1.
-     - **The cost:** small. In an alternating 2×2 benchmark it was 22.9 and 21.9 fps standing, against 23.1 and 23.0 with the heap in place (about 3%). One hand-played drive each came out at 19.9 vs 21.7 fps.
+     - **The cost:** one hand-played drive each came out at 19.9 fps with the copy and 21.7 fps in place, about 8%. An earlier 2×2 benchmark that showed about 3% was not valid (the settings leaked between runs), and its clean re-run is still to do.
      - **The result:** a 15-minute drive at top speed did not crash.
      - `VICTORY_PORT_LOW=1` puts the heap back in place.
 3. **No 300–800 ms freezes while new pipelines compile**: `VICTORY_PIPELINE_WAIT_MS=10`, set in `tools\settings.cmd`.
@@ -84,10 +96,14 @@ The numbers mean the following:
 
 - **System settings:** Windows power plan, process and helper-thread priorities, CPU affinity layouts, spinning thread pools.
 - **Thread counts and build:** `VICTORY_THIN_THREADS` of 4, 6 or 12; `VICTORY_WIDE_THREADS=8`; thin LTO with `codegen-units=1`.
-- **Other switches:** `VICTORY_HEAP_SYNC_EARLY`, `VICTORY_JOIN_PARTS=32`, `VICTORY_SUBMIT_FRAMES=2` (tested twice, 2×2 runs).
-- **More memory in place:** `VICTORY_INPLACE_BIG=1` puts the big private buffers in place, but showed no clear gain (2×2 runs). `VICTORY_ARRANGE_ALL=1` tries to make the title's scattered pool buffers one stretch, the way upstream's `arrange` does for the 32-bit heap. The title maps those buffers one page per call into pages that DirectStorage has already filled, so no page could be moved without copying its data. Both switches are kept, off.
+- **Other switches:** `VICTORY_HEAP_SYNC_EARLY`, `VICTORY_JOIN_PARTS=32`. (`VICTORY_SUBMIT_FRAMES=2` was also reported here as no gain, but that test was not valid because settings leaked between runs. It is still to be re-tested.)
+- **More memory in place:** `VICTORY_INPLACE_BIG=1` puts the big private buffers in place.
+  - **Clean re-test:** the submit thread's prep fell from about 35 to 28 ms a frame (−19%), and the title waited less at presents (12.5 vs 16.5 ms). But fps rose only 1–5%, which is at the edge of the noise.
+  - **What that means:** once the prep is cheaper, something else holds the frame.
+  - It stays off until it has had a long stability run.
+- **Arranging the pool's pages:** `VICTORY_ARRANGE_ALL=1` tries to make the title's scattered pool buffers one stretch, the way upstream's `arrange` does for the 32-bit heap. The title maps those buffers one page per call into pages that DirectStorage has already filled, so no page could be moved without copying its data. The switch is kept, off.
 - **Making the "nothing changed" checks cheaper:** a profile of the submit thread shows the checks are a small part of its time. Its CPU goes to copying bytes (about 27%), asking Windows about written pages (`GetWriteWatch`, about 15%) and refreshing textures (about 16%), and it waits more than half the time.
-- **Skipping the sun's shadow maps:** `VICTORY_SKIP_NAMES=CascadeShadows`. That removes about 22% of all draw calls, but fps didn't change (2×2 runs). So translating the title's draw calls is not what limits the frame. The limit is the submit thread's bookkeeping for memory that is still copied: about 10 ms a frame of checks, 96% of which find nothing new.
+- **Skipping the sun's shadow maps:** `VICTORY_SKIP_NAMES=CascadeShadows`. That removes about a third of the draw calls standing (12,000 → 8,000). Fps didn't change in a clean, alternating re-test: 20.8 fps standing against 20.7 for the default runs beside it. So translating the title's draw calls is not what limits the frame. The limit is the submit thread's bookkeeping for memory that is still copied: about 10 ms a frame of checks, 96% of which find nothing new.
 - **Smaller memory windows:** `VICTORY_WINDOW_KB` 256 or 64 put up to 3.5 GB in place, but fps didn't change and the layer kept rebuilding regions.
 - **Moving the game data from D: to C:**, both NVMe drives.
 - **The title's own graphics settings:** they have no performance options.
