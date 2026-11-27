@@ -3,7 +3,11 @@
 A personal fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs an Xbox Series title on Windows from files you supply. VIopus is tuned for an **AMD Ryzen + Radeon RX 9070 XT** PC. The goal is a stable 30 fps or more in the open world, from real rendered frames only (no frame generation).
 
 > [!NOTE]
-> **Performance first, graphics later.** For now VIopus does not care how the game looks, only how fast it runs. Settings and changes are chosen for frame rate even when the picture suffers. Examples: the Series S profile at its 1280×720 render size, ray tracing off, and the cheap ambient-light stand-in. Visual quality comes after the frame rate is where it should be.
+> **Priorities, in this order:**
+>
+> 1. **Frame rate and performance.** The target is a stable 30 fps or more while driving. Today that is still under 20 in places, which is not playable.
+> 2. **Stability.** No crashes or leaks in long sessions. A faster setting that crashes is kept off by default until it is safe.
+> 3. **Graphics, later.** For now VIopus does not care how the game looks. Settings and changes are chosen for frame rate even when the picture suffers. Examples: the Series S profile at its 1280×720 render size, ray tracing off, and the cheap ambient-light stand-in.
 
 > [!IMPORTANT]
 > **Measured on one PC only.** Every number here comes from this machine:
