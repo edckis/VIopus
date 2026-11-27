@@ -34,6 +34,18 @@ use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
+/// Whether the page pool's sections are made committed whole (`SEC_COMMIT`):
+/// always under Wine, and with `VICTORY_POOL_COMMIT=1` (VIopus core rebuild:
+/// only a committed section can be opened as one host heap, so the card can
+/// read the pool where the title has it). Costs commit charge for the whole
+/// pool up front (about 4.7 GB for the title), not RAM: untouched pages stay
+/// demand-zero.
+pub(crate) fn pool_committed() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| on_wine() || std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
     static WINE: LazyLock<bool> = LazyLock::new(|| {
@@ -666,7 +678,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | if pool_committed() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -686,7 +698,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, pool_committed());
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -1887,8 +1899,8 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    if pool_committed() {
+        return true; // sections are committed whole then
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
