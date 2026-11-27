@@ -2764,6 +2764,7 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
             write_view_address(*data, index, view);
+            write_view_direct_bytes(*data, index, view);
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -3676,6 +3677,26 @@ pub(crate) fn view_address(view: &View) -> Option<u64> {
         }
         _ => buffer_range(view).map(|range| range.0),
     }
+}
+
+/// VIopus core rebuild (`VICTORY_DIRECT=1`): enters the bytes of `view` at
+/// title slot `index` of the third table of the mapping at `data`
+/// (`victory_shader::emit::VIEW_DIRECT_BYTES`) when it is a shader resource
+/// view of a buffer, 0 for anything else: shaders may read such a view in
+/// the title's memory in place.
+fn write_view_direct_bytes(data: usize, index: u32, view: Option<&View>) {
+    use victory_shader::emit::{SLOT_STRIDES_COUNT, VIEW_DIRECT_BYTES};
+    if index >= SLOT_STRIDES_COUNT || !victory_shader::emit::direct() {
+        return;
+    }
+    let bytes = view
+        .filter(|v| matches!(v, View::Shader(..)))
+        .and_then(buffer_range)
+        .map_or(0, |(_, len)| u32::try_from(len).unwrap_or(0));
+    let at = (data + VIEW_DIRECT_BYTES as usize) as *mut u32;
+    // SAFETY: inside the mapping (`SLOT_STRIDES_BYTES`); shaders read it
+    // while we write (a dword, either value is one the slot had).
+    unsafe { at.add(index as usize).write_volatile(bytes) };
 }
 
 /// Enters the title address of `view` (0 for none, or a view that is no

@@ -41,8 +41,14 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// Read by a program that takes the address out of a descriptor it picks
 /// at a computed index and walks the memory behind it.
 pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Where the [`SLOT_STRIDES`] buffer's third table begins (bytes), VIopus
+/// core rebuild ([`direct`]): one dword per view heap slot, the bytes of the
+/// shader resource view of a buffer there (0 for anything else: an unordered
+/// access view, a texture, nothing). A buffer access through such a view may
+/// read the title's memory in place ([`SLOT_DIRECT`]).
+pub const VIEW_DIRECT_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 /// Bytes of the whole [`SLOT_STRIDES`] buffer.
-pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
+pub const SLOT_STRIDES_BYTES: u32 = VIEW_DIRECT_BYTES + SLOT_STRIDES_COUNT * 4;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -97,6 +103,43 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// has no size, and the host's copy of what it names may end in the middle of
 /// it (a structure of megabytes crosses the 4 MiB windows).
 pub const USER_ROOT_ADDRESS: u32 = 0x104;
+/// VIopus core rebuild (`VICTORY_DIRECT=1`, [`direct`]): the root SRV
+/// `t<SLOT_DIRECT>` in [`ROOT_CBV_SPACE`] is the bound view heap's table by
+/// slot (the [`SLOT_STRIDES`] buffer: [`VIEW_ADDRESSES`], [`VIEW_DIRECT_BYTES`]),
+/// bound as a root SRV of its own so the host does not take it for a shader
+/// that picks views from the whole heap. View-heap slot `base` (the user-data
+/// dword of kind [`USER_DIRECT_BASE`]) is the **directory** of the title's
+/// page pool by address (the layout of [`SLOT_MEMORY`]'s: per 64 KiB page the
+/// number + 1 of the pool section that page shows, 0 for none, with
+/// [`DIRECT_WRITTEN`] when the card writes that page through a host copy, and
+/// the page's byte offset in that section); section `n`'s raw view is at
+/// slot `base + n + 1`.
+pub const SLOT_DIRECT: u8 = 252;
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the directory, before the pool sections' views ([`SLOT_DIRECT`]).
+pub const USER_DIRECT_BASE: u32 = 0x107;
+/// In a [`SLOT_DIRECT`] directory entry's number: the card writes the page
+/// through a host copy, which shaders read there instead.
+pub const DIRECT_WRITTEN: u32 = 1 << 31;
+
+/// VIopus core rebuild: `VICTORY_DIRECT=1` has whole-dword buffer loads
+/// through a shader resource view in a table read the title's memory in
+/// place, page by page, where the directory has the page and the card never
+/// writes it through a host copy; elsewhere the host's view, as before.
+/// Part of the translation: the shader cache keys on it.
+pub fn direct() -> bool {
+    direct_on()
+}
+
+/// The version of the in-place translation ([`direct`]), part of the shader
+/// cache's key while it is on: bump it with every change to what it emits.
+pub const DIRECT_VERSION: u32 = 4;
+
+fn direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DIRECT").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `RootType::Other` code of a user-data dword the host sets at a dispatch
 /// counted in threads (the console's `DispatchX`): how many of the threads
 /// numbered along X run (0: all of every group). The metadata's `dword` is

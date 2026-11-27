@@ -1324,6 +1324,15 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        // VIopus core rebuild (`VICTORY_DIRECT=1`): the run of pool sections'
+        // views in the bound heap, and per buffer view whether it is all in
+        // the pool in place (its bytes) or not (0: the host's view).
+        if kind == victory_shader::emit::USER_DIRECT_BASE {
+            return match self.heaps[0] {
+                0 => 0,
+                h => crate::descriptor::heap(h as This).host().and_then(crate::direct::base_for).unwrap_or(0),
+            };
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
@@ -1705,6 +1714,36 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == victory_shader::emit::SLOT_DIRECT {
+                        // Ours: the bound view heap's table by slot (view
+                        // addresses and bytes), without the whole-heap pass
+                        // the table of strides asks for.
+                        let host_heap = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host());
+                        let gpu = host_heap.and_then(|h| {
+                            if let Some(buffer) = h.strides_buffer() {
+                                list.keep(buffer);
+                            }
+                            h.strides_gpu()
+                        });
+                        if let Some(gpu) = gpu {
+                            // SAFETY: an open list; the directory lives as
+                            // long as the process.
+                            unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {

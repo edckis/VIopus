@@ -77,8 +77,8 @@ unsafe impl Send for Direct {}
 static DIRECT: Mutex<Option<Direct>> = Mutex::new(None);
 
 /// Since the start: pages filled, pages cleared, pages above the directory,
-/// views of sections not known; sections opened, refused.
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// views of sections not known; sections opened, refused; pool pages the card writes.
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// The directory, made when first needed: the runtime makes the pool's
 /// sections before the title has a device, and the directory waits for the
@@ -165,11 +165,12 @@ impl Direct {
             } else {
                 let byte = offset + (page * PAGE - at);
                 let entry = self.entry(page);
+                let flag = if is_written(n as u32 + 1, byte as u32) { WRITTEN_FLAG } else { 0 };
                 // The offset first: a shader that sees the number sees it too.
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe {
                     entry.add(1).write_volatile(byte as u32);
-                    entry.write_volatile(n as u32 + 1);
+                    entry.write_volatile((n as u32 + 1) | flag);
                 }
                 STATS[0].fetch_add(1, Ordering::Relaxed);
             }
@@ -257,8 +258,8 @@ pub(crate) fn unmapped(at: usize, len: usize) {
 /// directory.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
-    /// The view heap slot that reads zeros; section `n`'s view is `n + 1`
-    /// further.
+    /// The view heap slot of the directory's raw view; section `n`'s view
+    /// is `n + 1` further.
     pub(crate) base: u32,
 }
 
@@ -273,7 +274,11 @@ pub(crate) fn ready(heap: &HostHeap) -> Option<Ready> {
             None => {
                 // Held for the heap's life.
                 let base = heap.dynamic(COPIES + 1)?;
-                for n in 0..=COPIES {
+                // Slot `base`: the directory itself (what an entry of no
+                // section would name is never used: such accesses take the
+                // host's view). Then the sections, null until opened.
+                heap.raw_uav_at(base, &d.directory, 0, u64::from(MEMORY_PAGES) * 8);
+                for n in 1..=COPIES {
                     heap.null_raw_uav_at(base + n);
                 }
                 (base, 0)
@@ -286,6 +291,7 @@ pub(crate) fn ready(heap: &HostHeap) -> Option<Ready> {
         }
         let opened = d.sections.iter().take_while(|s| s.opened.is_some() || s.refused).count() as u32;
         d.heaps.insert(key, (base, opened));
+        OPENED.store(u64::from(opened), Ordering::Release);
         Some(Ready { directory: d.gpu, base })
         },
         |_| {},
@@ -293,28 +299,116 @@ pub(crate) fn ready(heap: &HostHeap) -> Option<Ready> {
     .flatten()
 }
 
-/// Whether every page of `[at, at + len)` is in the directory and its section
-/// open: an access there reaches the title's own bytes. Without a lock (a
-/// draw asks it per buffer); a mapping that changes meanwhile is the title's
-/// race, as on the console.
-pub(crate) fn covers(at: u64, len: u64) -> bool {
+/// The directory's GPU address, made first if need be (0 without a host).
+pub(crate) fn directory_gpu() -> u64 {
+    static GPU: AtomicU64 = AtomicU64::new(0);
+    let gpu = GPU.load(Ordering::Relaxed);
+    if gpu != 0 {
+        return gpu;
+    }
+    let gpu = with(
+        |d| {
+            d.open();
+            d.gpu
+        },
+        |_| {},
+    )
+    .unwrap_or(0);
+    GPU.store(gpu, Ordering::Relaxed);
+    gpu
+}
+
+/// Sections opened so far: a heap's run made before another opened lacks
+/// its view ([`base_for`]).
+static OPENED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// [`ready`]'s slot for `heap`, kept per thread: a draw asks it every time.
+pub(crate) fn base_for(heap: &HostHeap) -> Option<u32> {
+    thread_local! {
+        static KNOWN: std::cell::RefCell<HashMap<usize, (u64, u32)>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let key = std::ptr::from_ref(heap) as usize;
+    let opened = OPENED.load(Ordering::Acquire);
+    if let Some(base) = KNOWN.with(|k| k.borrow().get(&key).filter(|e| e.0 == opened).map(|e| e.1)) {
+        return Some(base);
+    }
+    let base = ready(heap)?.base;
+    let opened = OPENED.load(Ordering::Acquire);
+    KNOWN.with(|k| k.borrow_mut().insert(key, (opened, base)));
+    Some(base)
+}
+
+/// Pages of the pool shaders were ever declared to write through a host
+/// copy, one bit per 64 KiB of each section (by section number, then page):
+/// what the card writes there reaches the title's memory only when the copy
+/// is landed, so reads in place would see the bytes before. Kept by the
+/// section's page, not the address: the title shows a page at several.
+static WRITTEN: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+/// Bits per section in [`WRITTEN`]: 4 GiB of 64 KiB pages.
+const SECTION_PAGES: u64 = 1 << 16;
+/// In a directory entry's number: the card writes that page through a host
+/// copy (shaders take the host's view there, not the title's bytes).
+pub(crate) const WRITTEN_FLAG: u32 = 1 << 31;
+
+fn written_bits() -> &'static [AtomicU64] {
+    WRITTEN.get_or_init(|| (0..(u64::from(COPIES) * SECTION_PAGES / 64)).map(|_| AtomicU64::new(0)).collect())
+}
+
+/// The bit of section page `offset` of section `number` (as the directory
+/// holds it: index + 1).
+fn written_bit(number: u32, offset: u32) -> u64 {
+    u64::from((number & !WRITTEN_FLAG) - 1) * SECTION_PAGES + u64::from(offset) / PAGE
+}
+
+fn is_written(number: u32, offset: u32) -> bool {
+    let bit = written_bit(number, offset);
+    written_bits().get((bit / 64) as usize).is_some_and(|w| w.load(Ordering::Relaxed) & (1 << (bit % 64)) != 0)
+}
+
+/// Shaders are declared to write `[at, at + len)` through a host copy: the
+/// pages are flagged in the directory at every address that shows them, from
+/// now on, so shaders read the host's copy there.
+pub(crate) fn card_writes(at: u64, len: u64) {
     let entries = ENTRIES.load(Ordering::Acquire);
     if entries.is_null() || len == 0 {
-        return false;
+        return;
     }
+    let bits = written_bits();
     let mut page = at / PAGE;
-    while page * PAGE < at + len {
-        if page >= u64::from(MEMORY_PAGES) - 1 {
-            return false;
-        }
+    while page * PAGE < at + len && page < u64::from(MEMORY_PAGES) - 1 {
         // SAFETY: an entry of the directory, which lives for good.
-        let n = unsafe { entries.add(page as usize * 2).read_volatile() } as usize;
-        if n == 0 || !OPEN.get(n - 1).is_some_and(|o| o.load(Ordering::Acquire)) {
-            return false;
+        let (n, offset) = unsafe { (entries.add(page as usize * 2).read_volatile(), entries.add(page as usize * 2 + 1).read_volatile()) };
+        if n & !WRITTEN_FLAG != 0 {
+            let bit = written_bit(n, offset);
+            if let Some(word) = bits.get((bit / 64) as usize)
+                && word.fetch_or(1 << (bit % 64), Ordering::Relaxed) & (1 << (bit % 64)) == 0
+            {
+                // First time for this page of the pool: every address that
+                // shows it gets the flag (rare: once per page for the run).
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                let shown = crate::inplace::pages_of((page * PAGE) as usize);
+                with(
+                    |d| {
+                        for address in shown.iter().copied().chain(std::iter::once((page * PAGE) as usize)) {
+                            let p = address as u64 / PAGE;
+                            if p < u64::from(MEMORY_PAGES) - 1 {
+                                let entry = d.entry(p);
+                                // SAFETY: an entry of the directory, under the mutex.
+                                unsafe {
+                                    let now = entry.read_volatile();
+                                    if now != 0 && written_bit(now, entry.add(1).read_volatile()) == bit {
+                                        entry.write_volatile(now | WRITTEN_FLAG);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    |_| {},
+                );
+            }
         }
         page += 1;
     }
-    true
 }
 
 /// The line every ten seconds or so.
@@ -343,7 +437,7 @@ pub(crate) fn say() {
     );
     let (pages, open_bytes) = shown.unwrap_or((0, 0));
     tracing::info!(
-        "VIopus direct: {} pages of title addresses ({} MB) show the pool in place; sections open {} ({} MB), refused {}; since the start pages filled {}, cleared {}, above the directory {}, views of sections not known {}",
+        "VIopus direct: {} pages of title addresses ({} MB) show the pool in place; sections open {} ({} MB), refused {}; since the start pages filled {}, cleared {}, above the directory {}, views of sections not known {}; pool pages the card writes through host copies {} ({} MB)",
         pages,
         (pages * PAGE) >> 20,
         s[4],
@@ -352,6 +446,8 @@ pub(crate) fn say() {
         s[0],
         s[1],
         s[2],
-        s[3]
+        s[3],
+        s[6],
+        (s[6] * PAGE) >> 20
     );
 }

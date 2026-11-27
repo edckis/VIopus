@@ -3647,6 +3647,127 @@ impl<'a> Lower<'a> {
         (h, byte)
     }
 
+    /// Whether the program has room in the host's root signature for what the
+    /// in-place reads add (`direct_at`: one user-data dword, one root SRV):
+    /// a root signature holds 64 dwords, and a draw's stages share them. The
+    /// user data rounds up to 4 dwords; root views take 2, tables 1. A
+    /// program without room reads through the host's views only.
+    fn direct_fits(&self) -> bool {
+        let first = self.user_first();
+        let layout = &self.x.native.layout;
+        let own = layout.iter().map(|e| u32::from(e.user_data) + e.sgprs).max().unwrap_or(0).saturating_sub(first);
+        let asked = self.user_reads.keys().map(|&k| k + 1).max().unwrap_or(0);
+        let words = (own.max(asked) + 1).next_multiple_of(4);
+        let views = 2 * layout.iter().filter(|e| e.root == RootType::Descriptor).count() as u32;
+        // Ours: the table by slot, and the table of strides should the
+        // program also pick views by index.
+        let ours = 4;
+        let budget = if self.x.native.stage == HwStage::Cs { 64 } else { 32 };
+        words + views + ours <= budget
+    }
+
+    /// VIopus core rebuild (`shader.rs` `direct`): the view heap slot of the
+    /// buffer view an access goes through, when the program loads its
+    /// descriptor from a table or the heap; None for any other source.
+    fn direct_view(&mut self, src: &Source) -> Option<V> {
+        if !self.direct_fits() {
+            return None;
+        }
+        let Source::Loaded { load, first } = *src else {
+            return None;
+        };
+        let a = self.scalar.get(&load).copied()?;
+        let rp = *self.x.native.layout.get(a.param)?;
+        if !matches!(rp.root, RootType::Table | RootType::ResourceHeap) {
+            return None;
+        }
+        self.heap_index(load, first, false).ok()
+    }
+
+    /// The pool in place for an access of `count` dwords at byte `byte` of
+    /// the shader resource view at heap slot `slot`: the handle of the pool
+    /// section's raw view, the byte in it, and whether to read there. That is
+    /// so when the host's table gives the slot a buffer view's bytes
+    /// (`VIEW_DIRECT_BYTES`), the access lies inside them and inside one
+    /// directory page, and the directory has the page and does not flag it as
+    /// written by the card through a host copy. Otherwise the host's view.
+    fn direct_at(&mut self, slot: V, byte: V, count: u32) -> (V, V, V) {
+        use super::shader::{
+            DIRECT_WRITTEN, MEMORY_PAGES, SLOT_DIRECT, SLOT_STRIDES_COUNT, USER_DIRECT_BASE, VIEW_ADDRESSES,
+            VIEW_DIRECT_BYTES,
+        };
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let table = self.s.root_srv_handle(SLOT_DIRECT);
+        let iu = self.s.m.undef(i32t);
+        let align = k(self, 4);
+        // Inside the table whatever the slot.
+        let last = k(self, SLOT_STRIDES_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let (k2, k3) = (k(self, 2), k(self, 3));
+        let at = self.s.m.bin(c, Bin::Shl, slot, k3);
+        let addresses = k(self, VIEW_ADDRESSES);
+        let at = self.s.m.bin(c, Bin::Add, at, addresses);
+        let two = self.s.m.i8(3);
+        let words = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[table, at, iu, two, align]);
+        let (lo, hi) = (self.s.m.extract(c, words, 0), self.s.m.extract(c, words, 1));
+        let (lo, hi) = (self.as_int(lo), self.as_int(hi));
+        let at = self.s.m.bin(c, Bin::Shl, slot, k2);
+        let sizes = k(self, VIEW_DIRECT_BYTES);
+        let at = self.s.m.bin(c, Bin::Add, at, sizes);
+        let one = self.s.m.i8(1);
+        let size = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[table, at, iu, one, align]);
+        let bytes = self.s.m.extract(c, size, 0);
+        let bytes = self.as_int(bytes);
+        // The title address of the access.
+        let sum = self.s.m.bin(c, Bin::Add, lo, byte);
+        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let carry = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        let (k16, k8) = (k(self, 16), k(self, 0xFF));
+        let low = self.s.m.bin(c, Bin::LShr, sum, k16);
+        let high = self.s.m.bin(c, Bin::And, hi, k8);
+        let high = self.s.m.bin(c, Bin::Shl, high, k16);
+        let page = self.s.m.bin(c, Bin::Or, low, high);
+        // Inside the directory whatever the address; its last entry is
+        // never filled.
+        let last = k(self, MEMORY_PAGES - 1);
+        let page = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+        self.s.m.tag(page, Tag::Clamp);
+        let at = self.s.m.bin(c, Bin::Shl, page, k3);
+        let base = self.host_word(RootType::Other(USER_DIRECT_BASE), 0, 0);
+        let directory = self.s.heap_handle(c, base, false, false, (11 | 0x1000, 0));
+        let entry = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[directory, at, iu, two, align]);
+        let (n, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
+        let (n, start) = (self.as_int(n), self.as_int(start));
+        let zero = k(self, 0);
+        let flag = k(self, DIRECT_WRITTEN);
+        let written = self.s.m.bin(c, Bin::And, n, flag);
+        let not_written = self.s.m.cmp(c, pred::EQ, written, zero);
+        let number = k(self, !DIRECT_WRITTEN);
+        let n = self.s.m.bin(c, Bin::And, n, number);
+        let there = self.s.m.cmp(c, pred::NE, n, zero);
+        let len = k(self, 4 * count);
+        let end = self.s.m.bin(c, Bin::Add, byte, len);
+        let in_view = self.s.m.cmp(c, pred::IULE, end, bytes);
+        let starts_in = self.s.m.cmp(c, pred::IULT, byte, bytes);
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, sum, k64k);
+        let page_end = self.s.m.bin(c, Bin::Add, within, len);
+        let whole_page = k(self, 0x1_0000);
+        let in_page = self.s.m.cmp(c, pred::IULE, page_end, whole_page);
+        let ok = self.s.m.bin(c, Bin::And, in_view, starts_in);
+        let ok = self.s.m.bin(c, Bin::And, ok, in_page);
+        let ok = self.s.m.bin(c, Bin::And, ok, there);
+        let ok = self.s.m.bin(c, Bin::And, ok, not_written);
+        let slot = self.s.m.bin(c, Bin::Add, base, n);
+        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let at = self.s.m.bin(c, Bin::Add, start, within);
+        (h, at, ok)
+    }
+
     /// The title address in the root view `src` is built around, in a program
     /// with a spilled user-data table (`shader.rs` `USER_ROOT_ADDRESS`).
     fn root_address(&mut self, src: &Source) -> Option<(V, V)> {
@@ -12417,6 +12538,42 @@ impl<'a> Lower<'a> {
                 off = byte;
             }
         }
+        // VIopus core rebuild (`VICTORY_DIRECT=1`): whole-dword loads through
+        // a shader resource view in a table or the heap read the title's
+        // memory in place, page by page where they can; the host's view
+        // elsewhere (`direct_at`).
+        let direct = if super::shader::direct()
+            && !store
+            && !typed
+            && format.is_none()
+            && atomic.is_none()
+            && narrow.is_none()
+            && !d16
+            && self.root_address(src).is_none()
+            && used.is_none_or(|u| u.kind == ResourceType::Srv)
+        {
+            match self.direct_view(src) {
+                Some(slot) => {
+                    let c = self.cur;
+                    let byte = match index {
+                        None => Some(off),
+                        Some(i) if used.is_some_and(|u| u.stride == 1) => Some(self.s.m.bin(c, Bin::Add, i, off)),
+                        Some(i) => match used.map_or(0, |u| u.stride) {
+                            s if s >= 4 && s.is_multiple_of(4) => {
+                                let k = self.s.m.i32(s);
+                                let at = self.s.m.bin(c, Bin::Mul, i, k);
+                                Some(self.s.m.bin(c, Bin::Add, at, off))
+                            }
+                            _ => None,
+                        },
+                    };
+                    byte.map(|b| self.direct_at(slot, b, u32::from(count)))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let c = self.cur;
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let mut u = if uav { 0x1000 } else { 0 };
@@ -12647,8 +12804,8 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
             let void = self.s.t.void;
+            let at = self.begin_guarded(guard);
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
             return Ok(());
@@ -12766,9 +12923,22 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // In place (`direct`): the title's bytes where they can be read, the
+        // host's view's otherwise.
+        let ours = direct.map(|(h, byte, ok)| {
+            let mask = self.s.m.i8((1u8 << count) - 1);
+            let align = self.s.m.i32(4);
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
+            (r, ok)
+        });
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            let mut x = self.as_int(x);
+            if let Some((r, ok)) = ours {
+                let y = self.s.m.extract(c, r, k);
+                let y = self.as_int(y);
+                x = self.s.m.select(c, ok, y, x);
+            }
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

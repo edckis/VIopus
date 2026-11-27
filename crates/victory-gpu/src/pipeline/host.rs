@@ -528,6 +528,7 @@ impl HostPipeline {
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
+                            || slot == victory_shader::emit::SLOT_DIRECT
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
@@ -597,7 +598,20 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                // (The cost in dwords of the parameters: a root signature holds 64.)
+                let dwords: u32 = params
+                    .iter()
+                    .map(|p| match p.ParameterType {
+                        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => unsafe { p.Anonymous.Constants.Num32BitValues },
+                        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+                        _ => 2,
+                    })
+                    .sum();
+                let slots: Vec<String> = bound
+                    .iter()
+                    .map(|s| format!("cbv {:?} srv {:?} uav {:?} user {:?}", s.root_cbvs, s.root_srvs, s.root_uavs, s.user_data))
+                    .collect();
+                tracing::warn!(error = %e, ?shaders, dwords, params = params.len(), ?slots, "host root signature refused");
                 return None;
             }
         };

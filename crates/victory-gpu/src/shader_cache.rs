@@ -136,6 +136,12 @@ fn build() -> [u8; 32] {
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
         // bytes. Only when on, so the translations cached without it keep
         // their key.
+        // VIopus core rebuild (`VICTORY_DIRECT=1`): buffer accesses that may
+        // reach the pool in place. Only when on, as port 5's.
+        if victory_shader::emit::direct() {
+            bytes.extend_from_slice(b"VICTORY_DIRECT=1");
+            bytes.extend_from_slice(&victory_shader::emit::DIRECT_VERSION.to_le_bytes());
+        }
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }

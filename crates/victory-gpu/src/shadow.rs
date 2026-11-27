@@ -3258,6 +3258,9 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        // VIopus core rebuild: reads of these pages in place would see the
+        // bytes before this list's writes land.
+        crate::direct::card_writes(address, len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
