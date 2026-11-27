@@ -90,3 +90,4 @@ Thumbs.db
 /tools/testdata/
 /tools/testdata-template/
 /tools/prof-*.txt
+/tools/memguard.log

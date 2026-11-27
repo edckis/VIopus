@@ -522,6 +522,14 @@ impl Notes {
             return;
         }
         let noting = std::time::Instant::now();
+        // VIopus core rebuild: the card writes these pages through a copy of
+        // the host's, whatever wrote them (a shader, a copy, a target): reads
+        // in place there from now on would see bytes before the landing.
+        if crate::direct::on() {
+            for &(at, len) in &self.spans {
+                crate::direct::card_writes(at as u64, len as u64);
+            }
+        }
         let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
         TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
         if taken() {

@@ -67,6 +67,8 @@ switch ($Action) {
     "launcher file: $launcher"
     $p = Start-Process -FilePath $launcher -RedirectStandardOutput "$scr\gk.out" -RedirectStandardError $log -WindowStyle Hidden -PassThru
     "launcher pid $($p.Id)"
+    # Every automated run gets the memory guard (tools\memguard.ps1, log in tools\memguard.log).
+    Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$scr\memguard.ps1" -WindowStyle Hidden | Out-Null
   }
   'shot' {
     $g = Game; if (-not $g) { 'no game window'; exit 1 }
